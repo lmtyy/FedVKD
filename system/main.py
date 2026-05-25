@@ -9,6 +9,7 @@ import numpy as np
 import torchvision
 import logging
 import time
+import wandb
 
 from flcore.servers.serveravg import FedAvg
 from flcore.servers.servervls import FedVLS
@@ -20,6 +21,7 @@ from flcore.servers.serverrs import FedRS
 from flcore.servers.serverexp import FedEXP
 from flcore.servers.serverprox import FedProx
 from flcore.servers.servermoon import MOON
+from flcore.servers.servervkd import FedVKD          # ← 新增
 
 from flcore.trainmodel.models import *
 from flcore.trainmodel.resnetcifar import *
@@ -123,7 +125,13 @@ def run(args):
             args.model.fc = nn.Identity()
             args.model = BaseHeadSplit(args.model, args.head)
             server = FedVLS(args, i, party2loaders, global_train_dl, test_dl)
-            
+
+        elif args.algorithm == "FedVKD":
+            args.head = copy.deepcopy(args.model.fc)
+            args.model.fc = nn.Identity()
+            args.model = BaseHeadSplit(args.model, args.head)
+            server = FedVKD(args, i, party2loaders, global_train_dl, test_dl)
+
         elif args.algorithm == "FedMR":
             args.head = copy.deepcopy(args.model.fc)
             args.model.fc = nn.Identity()
@@ -163,7 +171,23 @@ def run(args):
         else:
             raise NotImplementedError
 
+        if args.use_wandb:
+            run_name = args.wandb_run_name or f"{args.algorithm}_{args.dataset}_alpha{args.alpha}_E{args.local_epochs}"
+            # 过滤掉不可序列化的对象（模型、head、device）
+            config_dict = {k: v for k, v in vars(args).items()
+                        if not isinstance(v, (torch.nn.Module, torch.device))}
+            wandb.init(
+                project=args.wandb_project,
+                entity=args.wandb_entity,
+                name=run_name,
+                config=config_dict,
+                reinit=True,
+            )
+
         server.train()
+
+        if args.use_wandb:
+            wandb.finish()
 
         time_list.append(time.time()-start)
 
@@ -253,6 +277,26 @@ if __name__ == "__main__":
     # FedExp
     parser.add_argument('-eps',"--eps", type=float, default=1e-3,
                             help='epsilon of the FedExp algorithm')
+    # ====== FedVKD 专用超参数 ======
+    parser.add_argument('--alpha_0', type=float, default=1.0,
+                        help='FedVKD: 基础蒸馏强度')
+    parser.add_argument('--temperature_kd', type=float, default=3.0,
+                        help='FedVKD: 蒸馏温度 T')
+    parser.add_argument('--gamma_schedule', type=float, default=1.5,
+                        help='FedVKD: 渐进调度曲线指数')
+    parser.add_argument('--beta_vkd', type=float, default=0.7,
+                        help='FedVKD: logit蒸馏 vs feature对齐 的权重')
+    parser.add_argument('--ema_mu', type=float, default=0.9,
+                        help='FedVKD: 脆弱度EMA平滑系数')
+    # ====== WandB 参数 ======
+    parser.add_argument('--use_wandb', action='store_true', default=False,
+                        help='是否启用 wandb 日志')
+    parser.add_argument('--wandb_project', type=str, default='FedVKD',
+                        help='wandb 项目名')
+    parser.add_argument('--wandb_entity', type=str, default=None,
+                        help='wandb 团队/用户名')
+    parser.add_argument('--wandb_run_name', type=str, default=None,
+                        help='run 名称（留空自动生成）')
  
     args = parser.parse_args()
     
@@ -317,4 +361,3 @@ if __name__ == "__main__":
     current_struct_time1 = time.localtime(time.time())
     formatted_time1 = time.strftime("%Y-%m-%d %H:%M:%S", current_struct_time1)
     
-
