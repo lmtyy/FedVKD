@@ -96,8 +96,8 @@ def run(args):
                     args.batch_size, args.batch_size, party2dataidx[party_id])
                 party2loaders[party_id] = train_dl_local
                 party2loaders_ds[party_id] = train_ds_local
-                for i in range(args.num_classes):
-                    datadistribution[party_id][i][0] = i
+                for cls in range(args.num_classes):
+                    datadistribution[party_id][cls][0] = cls
                 all_labels = np.empty((0,), dtype=np.int64)
                 for data, targets in party2loaders[party_id]:
                     labels = targets.numpy()  
@@ -278,16 +278,20 @@ if __name__ == "__main__":
     parser.add_argument('-eps',"--eps", type=float, default=1e-3,
                             help='epsilon of the FedExp algorithm')
     # ====== FedVKD 专用超参数 ======
-    parser.add_argument('--alpha_0', type=float, default=1.0,
-                        help='FedVKD: 基础蒸馏强度')
     parser.add_argument('--temperature_kd', type=float, default=3.0,
                         help='FedVKD: 蒸馏温度 T')
     parser.add_argument('--gamma_schedule', type=float, default=1.5,
                         help='FedVKD: 渐进调度曲线指数')
     parser.add_argument('--beta_vkd', type=float, default=0.7,
                         help='FedVKD: logit蒸馏 vs feature对齐 的权重')
-    parser.add_argument('--ema_mu', type=float, default=0.9,
-                        help='FedVKD: 脆弱度EMA平滑系数')
+    parser.add_argument('--alpha_0', type=float, default=0.5,
+                    help='FedVKD: 基础蒸馏强度（推荐 0.5）')
+    parser.add_argument('--ema_mu', type=float, default=0.5,
+                        help='FedVKD: 脆弱度EMA平滑系数（推荐 0.5）')
+    parser.add_argument('--warmup_rounds', type=int, default=10,
+                        help='FedVKD: 前若干轮纯 CE，避免蒸馏随机模型')
+    parser.add_argument('--vuln_threshold', type=float, default=0.05,
+                        help='FedVKD: 脆弱度激活阈值（绝对概率差）')
     # ====== WandB 参数 ======
     parser.add_argument('--use_wandb', action='store_true', default=False,
                         help='是否启用 wandb 日志')
@@ -336,7 +340,6 @@ if __name__ == "__main__":
         print("the temperature parameter for contrastive loss : {}".format(args.temperature))
         print("whether to use projection head : {}".format(args.use_proj_head))
     elif args.algorithm == "FedSAM":
-        print("momentum : {}".format(args.momentum))
         print("rho : {}".format(args.rho))
     elif args.algorithm == "FedLogitCal":
         print("calibration_temp : {}".format(args.calibration_temp))
