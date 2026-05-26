@@ -1,3 +1,11 @@
+"""
+flcore/servers/serveravg.py — FedAvg 服务端（修复版 v2）
+
+相对仓库现版的改动：
+1. ★ Budget[1:] 平均时长加保护，避免 auto_break 后 ZeroDivisionError
+2. ★ rs_test_acc 为空时不打印 max(...)，避免 ValueError
+3. wandb 上报增加 best_acc
+"""
 import time
 import torch
 import torch.nn as nn
@@ -5,6 +13,7 @@ import numpy as np
 import copy
 
 from flcore.clients.clientavg import clientAVG
+
 
 class FedAvg(object):
     def __init__(self, args, times, party2loaders, global_train_dl, test_dl):
@@ -54,16 +63,16 @@ class FedAvg(object):
         self.use_wandb = getattr(args, 'use_wandb', False)
 
     def train(self):
-        for round in range(self.global_rounds):
+        for round_idx in range(self.global_rounds):
             s_t = time.time()
             self.selected_clients = self.select_clients()
             self.send_models()
 
-            print(f"\n-------------Round number: {round}-------------")
+            print(f"\n-------------Round number: {round_idx}-------------")
             current_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time()))
             print(f"-------------{current_time}-------------")
 
-            # ★ clientAVG.train 只收一个参数（trainloader）
+            # clientAVG.train 只收一个参数（trainloader）
             for client in self.selected_clients:
                 client.train(self.party2loaders_train[client.id])
 
@@ -74,20 +83,27 @@ class FedAvg(object):
             test_acc, test_loss = self.compute_accuracy(self.global_model, self.party2loaders_test)
             print('>> Aggregated global model test accuracy : %f test loss: %f' % (test_acc, test_loss))
 
-            # ★ 必须 append，否则后面 max() 会爆
             self.rs_test_acc.append(test_acc)
             self.Budget.append(time.time() - s_t)
             print('-' * 25, 'time cost', '-' * 25, self.Budget[-1])
 
-            self._log_wandb(round, test_acc, test_loss)
+            self._log_wandb(round_idx, test_acc, test_loss)
 
             if self.auto_break and self.check_done(acc_lss=[self.rs_test_acc], top_cnt=self.top_cnt):
                 break
 
-        print("\nBest accuracy.")
-        print(max(self.rs_test_acc))
+        # ★ 防御式打印
+        if self.rs_test_acc:
+            print("\nBest accuracy: %.4f" % max(self.rs_test_acc))
+        else:
+            print("\nNo accuracy recorded.")
         print("\nAverage time cost per round.")
-        print(sum(self.Budget[1:]) / len(self.Budget[1:]))
+        if len(self.Budget) > 1:
+            print(sum(self.Budget[1:]) / len(self.Budget[1:]))
+        elif self.Budget:
+            print(self.Budget[0])
+        else:
+            print(0.0)
 
     def _log_wandb(self, round_idx, test_acc, test_loss):
         if not self.use_wandb:
@@ -99,6 +115,7 @@ class FedAvg(object):
         wandb.log({
             "server/test_acc": test_acc,
             "server/test_loss": test_loss,
+            "server/best_acc": max(self.rs_test_acc) if self.rs_test_acc else test_acc,
             "server/round": round_idx,
         }, step=round_idx)
 
@@ -112,7 +129,7 @@ class FedAvg(object):
         criterion = nn.CrossEntropyLoss()
         loss_collector = []
         with torch.no_grad():
-            for batch_idx, (x, target) in enumerate(dataloader):
+            for x, target in dataloader:
                 x, target = x.to(self.device), target.to(dtype=torch.int64).to(self.device)
                 out = model(x)
                 loss = criterion(out, target)
@@ -142,7 +159,7 @@ class FedAvg(object):
         return selected
 
     def send_models(self):
-        assert (len(self.clients) > 0)
+        assert len(self.clients) > 0
         for client in self.selected_clients:
             start_time = time.time()
             client.set_parameters(self.global_model)
@@ -150,7 +167,7 @@ class FedAvg(object):
             client.send_time_cost['total_cost'] += 2 * (time.time() - start_time)
 
     def receive_models(self):
-        assert (len(self.selected_clients) > 0)
+        assert len(self.selected_clients) > 0
         self.uploaded_ids = []
         self.uploaded_weights = []
         self.uploaded_models = []
@@ -164,15 +181,15 @@ class FedAvg(object):
             self.uploaded_weights[i] = w / tot_samples
 
     def aggregate_parameters(self):
-        assert (len(self.uploaded_models) > 0)
+        assert len(self.uploaded_models) > 0
         global_model_w = self.global_model.state_dict()
-        temp = True
+        first = True
         for w, client_model in zip(self.uploaded_weights, self.uploaded_models):
             client_model_w = client_model.state_dict()
-            if temp:
+            if first:
                 for key in client_model_w:
                     global_model_w[key] = client_model_w[key] * w
-                temp = False
+                first = False
             else:
                 for key in client_model_w:
                     global_model_w[key] += client_model_w[key] * w
