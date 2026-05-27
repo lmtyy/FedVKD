@@ -55,7 +55,7 @@ class clientAVG(object):
                 epoch_loss_collector.append(loss.item())
                 
             epoch_loss = sum(epoch_loss_collector) / len(epoch_loss_collector)
-            print('Epoch: %d Loss: %f' % (step, epoch_loss))        
+            #print('Epoch: %d Loss: %f' % (step, epoch_loss))        
         self.train_time_cost['num_rounds'] += 1
         self.train_time_cost['total_cost'] += time.time() - start_time
 

@@ -65,7 +65,7 @@ class clientVKD(object):
         start_time = time.time()
         trainloader = data_this_client
         self.model.train()
-        print(f"\n-------------client: {self.id}-------------")
+        #print(f"\n-------------client: {self.id}-------------")
 
         max_local_epochs = self.local_epochs
         use_distill = (round_idx >= self.warmup_rounds)
@@ -132,8 +132,8 @@ class clientVKD(object):
                 self._update_vulnerability(trainloader)
 
             epoch_loss = sum(epoch_loss_collector) / max(len(epoch_loss_collector), 1)
-            print('Epoch: %d Loss: %f alpha: %.4f distill: %s' % (
-                epoch, epoch_loss, alpha_e, str(do_kd_this_epoch)))
+            #print('Epoch: %d Loss: %f alpha: %.4f distill: %s' % (
+            #   epoch, epoch_loss, alpha_e, str(do_kd_this_epoch)))
 
         # ====== 记录指标供 server 上报 wandb ======
         self.last_round_metrics = {

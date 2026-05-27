@@ -69,9 +69,9 @@ class FedVKD(object):
             self.selected_clients = self.select_clients()
             self.send_models()
 
-            print(f"\n-------------Round number: {round_idx}-------------")
-            current_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time()))
-            print(f"-------------{current_time}-------------")
+            #print(f"\n-------------Round number: {round_idx}-------------")
+            #current_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time()))
+            #print(f"-------------{current_time}-------------")
 
             for client in self.selected_clients:
                 client.train(self.party2loaders_train[client.id], round_idx)
@@ -79,13 +79,13 @@ class FedVKD(object):
             self.receive_models()
             self.aggregate_parameters()
 
-            print("\nEvaluate aggregated global model")
+            #print("\nEvaluate aggregated global model")
             test_acc, test_loss = self.compute_accuracy(self.global_model, self.party2loaders_test)
-            print('>> Aggregated global model test accuracy : %f test loss: %f' % (test_acc, test_loss))
+            #print('>> Aggregated global model test accuracy : %f test loss: %f' % (test_acc, test_loss))
 
             self.rs_test_acc.append(test_acc)
             self.Budget.append(time.time() - s_t)
-            print('-' * 25, 'time cost', '-' * 25, self.Budget[-1])
+            self._print_compact(round_idx, test_acc, test_loss, self.Budget[-1])
 
             self._log_wandb(round_idx, test_acc, test_loss)
 
@@ -104,6 +104,43 @@ class FedVKD(object):
             print(self.Budget[0])
         else:
             print(0.0)
+    
+    def _print_compact(self, round_idx, test_acc, test_loss, round_time):
+        """图片同款紧凑日志：每轮一行，每 10 轮额外一行 [DIAG]"""
+        keys = ["total_loss", "alpha", "vuln_max", "vuln_mean",
+                "kd_loss", "ce_loss", "num_vuln_classes", "num_distill_classes"]
+        m = {}
+        for k in keys:
+            vals = [c.last_round_metrics.get(k, 0.0)
+                    for c in self.selected_clients
+                    if hasattr(c, 'last_round_metrics') and c.last_round_metrics]
+            m[k] = float(np.mean(vals)) if vals else 0.0
+
+        is_milestone = (round_idx % 10 == 0) or (round_idx == self.global_rounds - 1)
+
+        if is_milestone:
+            best = max(self.rs_test_acc) if self.rs_test_acc else 0.0
+            print(f"Round {round_idx:3d}/{self.global_rounds} | "
+                f"Loss: {m['total_loss']:.4f} | "
+                f"Test Acc: {test_acc*100:.2f}% | Best: {best*100:.2f}% | "
+                f"α={m['alpha']:.3f} vuln_max={m['vuln_max']:.3f} | "
+                f"distill_cls={m['num_distill_classes']:.1f} | "
+                f"Time: {round_time:.1f}s")
+
+            all_vmax = [c.last_round_metrics.get("vuln_max", 0.0)
+                        for c in self.selected_clients
+                        if hasattr(c, 'last_round_metrics') and c.last_round_metrics]
+            vlo = min(all_vmax) if all_vmax else 0.0
+            vhi = max(all_vmax) if all_vmax else 0.0
+            print(f"       [DIAG] vuln∈[{vlo:.3f},{vhi:.3f}] mean={m['vuln_mean']:.3f} | "
+                f"num_vuln={m['num_vuln_classes']:.1f} "
+                f"num_distill={m['num_distill_classes']:.1f} | "
+                f"kd_loss={m['kd_loss']:.4f} ce_loss={m['ce_loss']:.4f}")
+        else:
+            print(f"Round {round_idx:3d}/{self.global_rounds} | "
+                f"Loss: {m['total_loss']:.4f} | Test: {test_acc*100:.2f}% | "
+                f"α={m['alpha']:.3f} vuln_max={m['vuln_max']:.3f} | "
+                f"Time: {round_time:.1f}s")
 
     # ================================================================
     #                       wandb 上报
@@ -138,10 +175,12 @@ class FedVKD(object):
     #                       评估
     # ================================================================
     def compute_accuracy(self, model, dataloader):
-        was_training = False
-        if model.training:
-            model.eval()
-            was_training = True
+        was_training = model.training
+        model.eval()
+        # ★ 修复 BN 聚合污染：评估时让 BN 用当前 batch 统计而不是被 non-iid 污染的 running_stats
+        for m in model.modules():
+            if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
+                m.train()
 
         correct, total = 0, 0
         criterion = nn.CrossEntropyLoss()

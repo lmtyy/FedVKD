@@ -68,9 +68,9 @@ class FedAvg(object):
             self.selected_clients = self.select_clients()
             self.send_models()
 
-            print(f"\n-------------Round number: {round_idx}-------------")
-            current_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time()))
-            print(f"-------------{current_time}-------------")
+            #print(f"\n-------------Round number: {round_idx}-------------")
+            #current_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time()))
+            #print(f"-------------{current_time}-------------")
 
             # clientAVG.train 只收一个参数（trainloader）
             for client in self.selected_clients:
@@ -79,13 +79,23 @@ class FedAvg(object):
             self.receive_models()
             self.aggregate_parameters()
 
-            print("\nEvaluate aggregated global model")
+            #print("\nEvaluate aggregated global model")
             test_acc, test_loss = self.compute_accuracy(self.global_model, self.party2loaders_test)
             print('>> Aggregated global model test accuracy : %f test loss: %f' % (test_acc, test_loss))
 
             self.rs_test_acc.append(test_acc)
             self.Budget.append(time.time() - s_t)
-            print('-' * 25, 'time cost', '-' * 25, self.Budget[-1])
+            is_milestone = (round_idx % 10 == 0) or (round_idx == self.global_rounds - 1)
+            loss = test_loss  # 或者从 client 收集 train loss，这里偷懒用 test_loss
+            if is_milestone:
+                best = max(self.rs_test_acc) if self.rs_test_acc else 0.0
+                print(f"Round {round_idx:3d}/{self.global_rounds} | "
+                    f"Loss: {loss:.4f} | Test Acc: {test_acc*100:.2f}% | "
+                    f"Best: {best*100:.2f}% | Time: {self.Budget[-1]:.1f}s")
+            else:
+                print(f"Round {round_idx:3d}/{self.global_rounds} | "
+                    f"Loss: {loss:.4f} | Test: {test_acc*100:.2f}% | "
+                    f"Time: {self.Budget[-1]:.1f}s")
 
             self._log_wandb(round_idx, test_acc, test_loss)
 
@@ -120,10 +130,12 @@ class FedAvg(object):
         }, step=round_idx)
 
     def compute_accuracy(self, model, dataloader):
-        was_training = False
-        if model.training:
-            model.eval()
-            was_training = True
+        was_training = model.training
+        model.eval()
+        # ★ 修复 BN 聚合污染：评估时让 BN 用当前 batch 统计而不是被 non-iid 污染的 running_stats
+        for m in model.modules():
+            if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
+                m.train()
 
         correct, total = 0, 0
         criterion = nn.CrossEntropyLoss()

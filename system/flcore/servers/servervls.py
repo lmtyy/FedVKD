@@ -118,10 +118,12 @@ class FedVLS(object):
         }, step=round_idx)
 
     def compute_accuracy(self, model, dataloader):
-        was_training = False
-        if model.training:
-            model.eval()
-            was_training = True
+        was_training = model.training
+        model.eval()
+        # ★ 修复 BN 聚合污染：评估时让 BN 用当前 batch 统计而不是被 non-iid 污染的 running_stats
+        for m in model.modules():
+            if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
+                m.train()
 
         correct, total = 0, 0
         criterion = nn.CrossEntropyLoss()
