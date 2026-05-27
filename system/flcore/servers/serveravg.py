@@ -81,7 +81,7 @@ class FedAvg(object):
 
             #print("\nEvaluate aggregated global model")
             test_acc, test_loss = self.compute_accuracy(self.global_model, self.party2loaders_test)
-            print('>> Aggregated global model test accuracy : %f test loss: %f' % (test_acc, test_loss))
+            #print('>> Aggregated global model test accuracy : %f test loss: %f' % (test_acc, test_loss))
 
             self.rs_test_acc.append(test_acc)
             self.Budget.append(time.time() - s_t)

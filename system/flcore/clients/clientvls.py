@@ -58,7 +58,7 @@ class clientVLS(object):
             self.exist_prior = self.prior[self.exist_label]
         
         self.model.train()
-        print(f"\n-------------clinet: {self.id}-------------")    
+       #print(f"\n-------------clinet: {self.id}-------------")    
         max_local_epochs = self.local_epochs
     
         for step in range(max_local_epochs):
@@ -84,7 +84,7 @@ class clientVLS(object):
                 epoch_loss_collector.append(loss.item())
                 
             epoch_loss = sum(epoch_loss_collector) / len(epoch_loss_collector)
-            print('Epoch: %d Loss: %f' % (step, epoch_loss))
+            #print('Epoch: %d Loss: %f' % (step, epoch_loss))
         self.train_time_cost['num_rounds'] += 1
         self.train_time_cost['total_cost'] += time.time() - start_time
     
