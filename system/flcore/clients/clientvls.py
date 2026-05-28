@@ -58,7 +58,7 @@ class clientVLS(object):
             self.exist_prior = self.prior[self.exist_label]
         
         self.model.train()
-       #print(f"\n-------------clinet: {self.id}-------------")    
+        #print(f"\n-------------clinet: {self.id}-------------")    
         max_local_epochs = self.local_epochs
     
         for step in range(max_local_epochs):
