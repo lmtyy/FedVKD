@@ -1,10 +1,12 @@
 """
-flcore/servers/servervkd.py — FedVKD 服务端（修复版 v2）
+flcore/servers/servervkd.py — FedVKD 服务端（v3: Data-Aware Selective KD）
 
-相对仓库现版的改动：
-1. ★ Budget[1:] 平均时长加保护，避免 auto_break 后 ZeroDivisionError
-2. ★ rs_test_acc 为空时不打印 max(...)，避免 ValueError
-3. wandb 上报增加 best_acc，方便快速看效果
+核心改动：
+  1. set_clients() 后调用 _init_distill_weights()，
+     根据每个 client 的本地数据分布计算蒸馏权重
+  2. wandb 上报字段适配 v3 client 的 metrics
+  3. 新增 per-class accuracy 评估（用于论文公平性分析）
+  4. 每 10 轮打印 DIAG 信息
 """
 import time
 import torch
@@ -13,7 +15,6 @@ import numpy as np
 import copy
 
 from flcore.clients.clientvkd import clientVKD
-
 
 class FedVKD(object):
     def __init__(self, args, times, party2loaders, global_train_dl, test_dl):
@@ -54,11 +55,50 @@ class FedVKD(object):
         self.party2loaders_test = test_dl
 
         self.set_clients(clientVKD, party2loaders)
+
+        # ★ Data-Aware: 初始化每个 client 的蒸馏权重
+        self._init_distill_weights(party2loaders)
+
         print(f"\nJoin ratio / total clients: {self.join_ratio} / {self.num_clients}")
         print("Finished creating FedVKD server and clients.")
 
         self.Budget = []
         self.use_wandb = getattr(args, 'use_wandb', False)
+
+    # ================================================================
+    #          Data-Aware: 计算每个 client 的蒸馏权重
+    # ================================================================
+    def _init_distill_weights(self, party2loaders):
+        """遍历每个 client 的 dataloader，统计类别分布，计算蒸馏权重。"""
+        print("\n[Data-Aware] Computing distillation weights per client...")
+
+        # 统计每个 client 每个类的样本数
+        client_class_counts = np.zeros((self.num_clients, self.num_classes))
+        for cid in range(self.num_clients):
+            loader = party2loaders[cid]
+            for _, targets in loader:
+                for t in targets.numpy():
+                    client_class_counts[cid][t] += 1
+
+        # 计算全局平均每类样本数
+        total_samples = client_class_counts.sum()
+        global_avg_per_class = total_samples / self.num_classes / self.num_clients
+        print(f"[Data-Aware] Total samples: {int(total_samples)}, "
+              f"Global avg per class per client: {global_avg_per_class:.1f}")
+
+        # 为每个 client 设置蒸馏权重
+        for cid, client in enumerate(self.clients):
+            client.set_distill_weights(
+                local_class_counts=client_class_counts[cid],
+                global_avg_per_class=global_avg_per_class
+            )
+
+        # 打印汇总统计
+        all_weights = torch.stack([c.distill_weights for c in self.clients])
+        avg_num_distill = (all_weights > 0).float().sum(dim=1).mean().item()
+        avg_num_full = (all_weights >= 0.99).float().sum(dim=1).mean().item()
+        print(f"[Data-Aware] Avg distill classes per client: {avg_num_distill:.1f} "
+              f"(full: {avg_num_full:.1f}) / {self.num_classes}")
 
     # ================================================================
     #                       主训练循环
@@ -69,9 +109,9 @@ class FedVKD(object):
             self.selected_clients = self.select_clients()
             self.send_models()
 
-            #print(f"\n-------------Round number: {round_idx}-------------")
-            #current_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time()))
-            #print(f"-------------{current_time}-------------")
+            print(f"\n-------------Round number: {round_idx}-------------")
+            current_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time()))
+            print(f"-------------{current_time}-------------")
 
             for client in self.selected_clients:
                 client.train(self.party2loaders_train[client.id], round_idx)
@@ -79,22 +119,53 @@ class FedVKD(object):
             self.receive_models()
             self.aggregate_parameters()
 
-            #print("\nEvaluate aggregated global model")
+            print("\nEvaluate aggregated global model")
             test_acc, test_loss = self.compute_accuracy(self.global_model, self.party2loaders_test)
-            #print('>> Aggregated global model test accuracy : %f test loss: %f' % (test_acc, test_loss))
 
             self.rs_test_acc.append(test_acc)
             self.Budget.append(time.time() - s_t)
-            self._print_compact(round_idx, test_acc, test_loss, self.Budget[-1])
+
+            # 每 10 轮打印详细诊断
+            if round_idx % 10 == 0 or round_idx == self.global_rounds - 1:
+                best_acc = max(self.rs_test_acc)
+                # 计算 per-class accuracy
+                per_class_acc = self._compute_per_class_accuracy(
+                    self.global_model, self.party2loaders_test)
+                per_class_str = " ".join([f"{a:.1f}" for a in (per_class_acc * 100)])
+                std_acc = per_class_acc.std().item() * 100
+
+                # 汇总 client 蒸馏信息
+                avg_kd = np.mean([c.last_round_metrics.get("kd_loss", 0)
+                                  for c in self.selected_clients])
+                avg_ce = np.mean([c.last_round_metrics.get("ce_loss", 0)
+                                  for c in self.selected_clients])
+                avg_distill_cls = np.mean([c.last_round_metrics.get("num_distill_classes", 0)
+                                           for c in self.selected_clients])
+
+                print(f"Round {round_idx}/{self.global_rounds} | "
+                      f"Test Acc: {test_acc*100:.2f}% | Best: {best_acc*100:.2f}% | "
+                      f"distill_cls={avg_distill_cls:.1f} | Time: {self.Budget[-1]:.1f}s")
+                print(f"    [DIAG] per_class_acc=[{per_class_str}] std={std_acc:.2f} | "
+                      f"kd_loss={avg_kd:.4f} ce_loss={avg_ce:.4f}")
+            else:
+                # 普通轮次简洁输出
+                avg_alpha = np.mean([c.last_round_metrics.get("alpha", 0)
+                                     for c in self.selected_clients])
+                avg_distill_cls = np.mean([c.last_round_metrics.get("num_distill_classes", 0)
+                                           for c in self.selected_clients])
+                print(f"Round {round_idx}/{self.global_rounds} | "
+                      f"Loss: {test_loss:.4f} | Test: {test_acc*100:.2f}% | "
+                      f"α={avg_alpha:.3f} distill_cls={avg_distill_cls:.1f} | "
+                      f"Time: {self.Budget[-1]:.1f}s")
 
             self._log_wandb(round_idx, test_acc, test_loss)
 
             if self.auto_break and self.check_done(acc_lss=[self.rs_test_acc], top_cnt=self.top_cnt):
                 break
 
-        # ★ 防御式打印：这两行原版在边界条件会 crash
+        # 最终输出
         if self.rs_test_acc:
-            print("\nBest accuracy: %.4f" % max(self.rs_test_acc))
+            print(f"\nBest accuracy: {max(self.rs_test_acc):.4f}")
         else:
             print("\nNo accuracy recorded.")
         print("\nAverage time cost per round.")
@@ -104,43 +175,35 @@ class FedVKD(object):
             print(self.Budget[0])
         else:
             print(0.0)
-    
-    def _print_compact(self, round_idx, test_acc, test_loss, round_time):
-        """图片同款紧凑日志：每轮一行，每 10 轮额外一行 [DIAG]"""
-        keys = ["total_loss", "alpha", "vuln_max", "vuln_mean",
-                "kd_loss", "ce_loss", "num_vuln_classes", "num_distill_classes"]
-        m = {}
-        for k in keys:
-            vals = [c.last_round_metrics.get(k, 0.0)
-                    for c in self.selected_clients
-                    if hasattr(c, 'last_round_metrics') and c.last_round_metrics]
-            m[k] = float(np.mean(vals)) if vals else 0.0
 
-        is_milestone = (round_idx % 10 == 0) or (round_idx == self.global_rounds - 1)
+    # ================================================================
+    #                  Per-Class Accuracy 评估
+    # ================================================================
+    @torch.no_grad()
+    def _compute_per_class_accuracy(self, model, dataloader):
+        """计算每个类的准确率，返回 numpy array [C]。"""
+        was_training = model.training
+        model.eval()
 
-        if is_milestone:
-            best = max(self.rs_test_acc) if self.rs_test_acc else 0.0
-            print(f"Round {round_idx:3d}/{self.global_rounds} | "
-                f"Loss: {m['total_loss']:.4f} | "
-                f"Test Acc: {test_acc*100:.2f}% | Best: {best*100:.2f}% | "
-                f"α={m['alpha']:.3f} vuln_max={m['vuln_max']:.3f} | "
-                f"distill_cls={m['num_distill_classes']:.1f} | "
-                f"Time: {round_time:.1f}s")
+        correct = np.zeros(self.num_classes)
+        total = np.zeros(self.num_classes)
 
-            all_vmax = [c.last_round_metrics.get("vuln_max", 0.0)
-                        for c in self.selected_clients
-                        if hasattr(c, 'last_round_metrics') and c.last_round_metrics]
-            vlo = min(all_vmax) if all_vmax else 0.0
-            vhi = max(all_vmax) if all_vmax else 0.0
-            print(f"       [DIAG] vuln∈[{vlo:.3f},{vhi:.3f}] mean={m['vuln_mean']:.3f} | "
-                f"num_vuln={m['num_vuln_classes']:.1f} "
-                f"num_distill={m['num_distill_classes']:.1f} | "
-                f"kd_loss={m['kd_loss']:.4f} ce_loss={m['ce_loss']:.4f}")
-        else:
-            print(f"Round {round_idx:3d}/{self.global_rounds} | "
-                f"Loss: {m['total_loss']:.4f} | Test: {test_acc*100:.2f}% | "
-                f"α={m['alpha']:.3f} vuln_max={m['vuln_max']:.3f} | "
-                f"Time: {round_time:.1f}s")
+        for x, target in dataloader:
+            x = x.to(self.device)
+            target = target.to(dtype=torch.int64).to(self.device)
+            out = model(x)
+            _, pred = torch.max(out, 1)
+            for c in range(self.num_classes):
+                mask = (target == c)
+                total[c] += mask.sum().item()
+                correct[c] += ((pred == c) & mask).sum().item()
+
+        if was_training:
+            model.train()
+
+        # 避免除零
+        total = np.maximum(total, 1)
+        return correct / total
 
     # ================================================================
     #                       wandb 上报
@@ -160,9 +223,19 @@ class FedVKD(object):
             "server/round": round_idx,
         }
 
+        # 上报 per-class accuracy
+        per_class_acc = self._compute_per_class_accuracy(
+            self.global_model, self.party2loaders_test)
+        for c in range(self.num_classes):
+            log_dict[f"per_class/class_{c}_acc"] = per_class_acc[c]
+        log_dict["per_class/std"] = per_class_acc.std()
+        log_dict["per_class/min"] = per_class_acc.min()
+        log_dict["per_class/max"] = per_class_acc.max()
+
+        # 上报 client 平均指标
         keys = ["total_loss", "ce_loss", "kd_loss", "alpha",
-                "use_distill", "vuln_mean", "vuln_max",
-                "num_vuln_classes", "num_distill_classes"]
+                "use_distill", "num_distill_classes",
+                "num_full_distill_classes", "distill_weight_mean"]
         for k in keys:
             vals = [c.last_round_metrics[k] for c in self.selected_clients
                     if hasattr(c, 'last_round_metrics') and k in c.last_round_metrics]
@@ -175,12 +248,10 @@ class FedVKD(object):
     #                       评估
     # ================================================================
     def compute_accuracy(self, model, dataloader):
-        was_training = model.training
-        model.eval()
-        # ★ 修复 BN 聚合污染：评估时让 BN 用当前 batch 统计而不是被 non-iid 污染的 running_stats
-        for m in model.modules():
-            if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
-                m.train()
+        was_training = False
+        if model.training:
+            model.eval()
+            was_training = True
 
         correct, total = 0, 0
         criterion = nn.CrossEntropyLoss()
