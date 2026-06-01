@@ -1,19 +1,20 @@
 """
-flcore/servers/serveravg.py — FedAvg 服务端（修复版 v2）
+flcore/servers/serveravg.py — FedAvg 服务端（P1 方案B：BN 重校准评估口径）
 
-相对仓库现版的改动：
-1. ★ Budget[1:] 平均时长加保护，避免 auto_break 后 ZeroDivisionError
-2. ★ rs_test_acc 为空时不打印 max(...)，避免 ValueError
-3. wandb 上报增加 best_acc
+P1 改动：
+1. 删除旧的「评估时把 BN 设回 train」hack
+2. 新增 recalibrate_bn：聚合后在【global_model 的副本】上用全局训练集重算 BN 统计
+3. compute_accuracy 统一为纯 eval（返回 2 个值）
+4. __init__ 保存 self.global_train_dl
+评估在副本上进行，不改变下一轮下发给 client 的聚合模型。
 """
 import time
+import copy
 import torch
 import torch.nn as nn
 import numpy as np
-import copy
 
 from flcore.clients.clientavg import clientAVG
-
 
 class FedAvg(object):
     def __init__(self, args, times, party2loaders, global_train_dl, test_dl):
@@ -53,6 +54,7 @@ class FedAvg(object):
         self.times = times
         self.party2loaders_train = party2loaders
         self.party2loaders_test = test_dl
+        self.global_train_dl = global_train_dl       # ★ P1: BN 重校准用全局训练集
 
         self.set_clients(clientAVG, party2loaders)
 
@@ -68,41 +70,35 @@ class FedAvg(object):
             self.selected_clients = self.select_clients()
             self.send_models()
 
-            #print(f"\n-------------Round number: {round_idx}-------------")
-            #current_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time()))
-            #print(f"-------------{current_time}-------------")
-
-            # clientAVG.train 只收一个参数（trainloader）
             for client in self.selected_clients:
                 client.train(self.party2loaders_train[client.id])
 
             self.receive_models()
             self.aggregate_parameters()
 
-            #print("\nEvaluate aggregated global model")
-            test_acc, test_loss = self.compute_accuracy(self.global_model, self.party2loaders_test)
-            #print('>> Aggregated global model test accuracy : %f test loss: %f' % (test_acc, test_loss))
+            # ★ P1: 在副本上重校准 BN 再评估，不影响下一轮下发的聚合模型
+            eval_model = copy.deepcopy(self.global_model)
+            self.recalibrate_bn(eval_model, self.global_train_dl)
+            test_acc, test_loss = self.compute_accuracy(eval_model, self.party2loaders_test)
 
             self.rs_test_acc.append(test_acc)
             self.Budget.append(time.time() - s_t)
             is_milestone = (round_idx % 10 == 0) or (round_idx == self.global_rounds - 1)
-            loss = test_loss  # 或者从 client 收集 train loss，这里偷懒用 test_loss
             if is_milestone:
                 best = max(self.rs_test_acc) if self.rs_test_acc else 0.0
                 print(f"Round {round_idx:3d}/{self.global_rounds} | "
-                    f"Loss: {loss:.4f} | Test Acc: {test_acc*100:.2f}% | "
-                    f"Best: {best*100:.2f}% | Time: {self.Budget[-1]:.1f}s")
+                      f"Loss: {test_loss:.4f} | Test Acc: {test_acc*100:.2f}% | "
+                      f"Best: {best*100:.2f}% | Time: {self.Budget[-1]:.1f}s")
             else:
                 print(f"Round {round_idx:3d}/{self.global_rounds} | "
-                    f"Loss: {loss:.4f} | Test: {test_acc*100:.2f}% | "
-                    f"Time: {self.Budget[-1]:.1f}s")
+                      f"Loss: {test_loss:.4f} | Test: {test_acc*100:.2f}% | "
+                      f"Time: {self.Budget[-1]:.1f}s")
 
             self._log_wandb(round_idx, test_acc, test_loss)
 
             if self.auto_break and self.check_done(acc_lss=[self.rs_test_acc], top_cnt=self.top_cnt):
                 break
 
-        # ★ 防御式打印
         if self.rs_test_acc:
             print("\nBest accuracy: %.4f" % max(self.rs_test_acc))
         else:
@@ -129,31 +125,48 @@ class FedAvg(object):
             "server/round": round_idx,
         }, step=round_idx)
 
+    # ★ P1 核心：BN 重校准（方案B）
+    @torch.no_grad()
+    def recalibrate_bn(self, model, loader, num_batches=50):
+        """用全局训练数据重算 BN 的 running_mean/var。就地修改传入的 model。"""
+        model.train()
+        for m in model.modules():
+            if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
+                m.reset_running_stats()
+        seen = 0
+        for x, _ in loader:
+            if seen >= num_batches:
+                break
+            if isinstance(x, list):
+                x[0] = x[0].to(self.device)
+                bs = x[0].size(0)
+            else:
+                x = x.to(self.device)
+                bs = x.size(0)
+            if bs <= 1:                 # 跳过单样本 batch，否则 BN 在 train 模式下报错
+                continue
+            model(x)
+            seen += 1
+        model.eval()
+
+    # ★ P1：统一的纯 eval 评估（返回 2 个值）
     def compute_accuracy(self, model, dataloader):
         was_training = model.training
         model.eval()
-        # ★ 修复 BN 聚合污染：评估时让 BN 用当前 batch 统计而不是被 non-iid 污染的 running_stats
-        for m in model.modules():
-            if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
-                m.train()
-
         correct, total = 0, 0
         criterion = nn.CrossEntropyLoss()
         loss_collector = []
         with torch.no_grad():
             for x, target in dataloader:
-                x, target = x.to(self.device), target.to(dtype=torch.int64).to(self.device)
+                x, target = x.to(self.device), target.to(torch.int64).to(self.device)
                 out = model(x)
-                loss = criterion(out, target)
-                _, pred_label = torch.max(out.data, 1)
-                loss_collector.append(loss.item())
-                total += x.data.size()[0]
-                correct += (pred_label == target.data).sum().item()
-            avg_loss = sum(loss_collector) / max(len(loss_collector), 1)
-
+                loss_collector.append(criterion(out, target).item())
+                _, pred = torch.max(out, 1)
+                total += target.size(0)
+                correct += (pred == target).sum().item()
         if was_training:
             model.train()
-        return correct / float(total), avg_loss
+        return correct / float(total), sum(loss_collector) / max(len(loss_collector), 1)
 
     def set_clients(self, clientObj, party2loaders):
         for i in range(self.num_clients):

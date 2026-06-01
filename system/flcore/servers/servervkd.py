@@ -1,18 +1,17 @@
 """
-flcore/servers/servervkd.py — FedVKD 服务端（v3: Data-Aware Selective KD）
+flcore/servers/servervkd.py — FedVKD 服务端（v3 + P1 方案B BN重校准）
 
-核心改动：
-  1. set_clients() 后调用 _init_distill_weights()，
-     根据每个 client 的本地数据分布计算蒸馏权重
-  2. wandb 上报字段适配 v3 client 的 metrics
-  3. 新增 per-class accuracy 评估（用于论文公平性分析）
-  4. 每 10 轮打印 DIAG 信息
+P1 改动：
+1. __init__ 保存 self.global_train_dl
+2. 新增 recalibrate_bn；评估在 global_model 的副本上进行
+3. per-class accuracy / wandb 全部基于重校准后的 eval_model，口径统一
+4. compute_accuracy 统一为纯 eval
 """
 import time
+import copy
 import torch
 import torch.nn as nn
 import numpy as np
-import copy
 
 from flcore.clients.clientvkd import clientVKD
 
@@ -53,6 +52,7 @@ class FedVKD(object):
         self.times = times
         self.party2loaders_train = party2loaders
         self.party2loaders_test = test_dl
+        self.global_train_dl = global_train_dl       # ★ P1: BN 重校准用全局训练集
 
         self.set_clients(clientVKD, party2loaders)
 
@@ -69,10 +69,7 @@ class FedVKD(object):
     #          Data-Aware: 计算每个 client 的蒸馏权重
     # ================================================================
     def _init_distill_weights(self, party2loaders):
-        """遍历每个 client 的 dataloader，统计类别分布，计算蒸馏权重。"""
         print("\n[Data-Aware] Computing distillation weights per client...")
-
-        # 统计每个 client 每个类的样本数
         client_class_counts = np.zeros((self.num_clients, self.num_classes))
         for cid in range(self.num_clients):
             loader = party2loaders[cid]
@@ -80,20 +77,17 @@ class FedVKD(object):
                 for t in targets.numpy():
                     client_class_counts[cid][t] += 1
 
-        # 计算全局平均每类样本数
         total_samples = client_class_counts.sum()
         global_avg_per_class = total_samples / self.num_classes / self.num_clients
         print(f"[Data-Aware] Total samples: {int(total_samples)}, "
               f"Global avg per class per client: {global_avg_per_class:.1f}")
 
-        # 为每个 client 设置蒸馏权重
         for cid, client in enumerate(self.clients):
             client.set_distill_weights(
                 local_class_counts=client_class_counts[cid],
                 global_avg_per_class=global_avg_per_class
             )
 
-        # 打印汇总统计
         all_weights = torch.stack([c.distill_weights for c in self.clients])
         avg_num_distill = (all_weights > 0).float().sum(dim=1).mean().item()
         avg_num_full = (all_weights >= 0.99).float().sum(dim=1).mean().item()
@@ -120,21 +114,20 @@ class FedVKD(object):
             self.aggregate_parameters()
 
             print("\nEvaluate aggregated global model")
-            test_acc, test_loss = self.compute_accuracy(self.global_model, self.party2loaders_test)
+            # ★ P1: 副本重校准 BN，后续所有评估都用 eval_model
+            eval_model = copy.deepcopy(self.global_model)
+            self.recalibrate_bn(eval_model, self.global_train_dl)
+            test_acc, test_loss = self.compute_accuracy(eval_model, self.party2loaders_test)
 
             self.rs_test_acc.append(test_acc)
             self.Budget.append(time.time() - s_t)
 
-            # 每 10 轮打印详细诊断
             if round_idx % 10 == 0 or round_idx == self.global_rounds - 1:
                 best_acc = max(self.rs_test_acc)
-                # 计算 per-class accuracy
-                per_class_acc = self._compute_per_class_accuracy(
-                    self.global_model, self.party2loaders_test)
+                per_class_acc = self._compute_per_class_accuracy(eval_model, self.party2loaders_test)
                 per_class_str = " ".join([f"{a:.1f}" for a in (per_class_acc * 100)])
                 std_acc = per_class_acc.std().item() * 100
 
-                # 汇总 client 蒸馏信息
                 avg_kd = np.mean([c.last_round_metrics.get("kd_loss", 0)
                                   for c in self.selected_clients])
                 avg_ce = np.mean([c.last_round_metrics.get("ce_loss", 0)
@@ -148,7 +141,6 @@ class FedVKD(object):
                 print(f"    [DIAG] per_class_acc=[{per_class_str}] std={std_acc:.2f} | "
                       f"kd_loss={avg_kd:.4f} ce_loss={avg_ce:.4f}")
             else:
-                # 普通轮次简洁输出
                 avg_alpha = np.mean([c.last_round_metrics.get("alpha", 0)
                                      for c in self.selected_clients])
                 avg_distill_cls = np.mean([c.last_round_metrics.get("num_distill_classes", 0)
@@ -158,12 +150,11 @@ class FedVKD(object):
                       f"α={avg_alpha:.3f} distill_cls={avg_distill_cls:.1f} | "
                       f"Time: {self.Budget[-1]:.1f}s")
 
-            self._log_wandb(round_idx, test_acc, test_loss)
+            self._log_wandb(round_idx, test_acc, test_loss, eval_model)
 
             if self.auto_break and self.check_done(acc_lss=[self.rs_test_acc], top_cnt=self.top_cnt):
                 break
 
-        # 最终输出
         if self.rs_test_acc:
             print(f"\nBest accuracy: {max(self.rs_test_acc):.4f}")
         else:
@@ -176,18 +167,35 @@ class FedVKD(object):
         else:
             print(0.0)
 
-    # ================================================================
-    #                  Per-Class Accuracy 评估
-    # ================================================================
+    # ★ P1 核心：BN 重校准
     @torch.no_grad()
-    def _compute_per_class_accuracy(self, model, dataloader):
-        """计算每个类的准确率，返回 numpy array [C]。"""
-        was_training = model.training
+    def recalibrate_bn(self, model, loader, num_batches=50):
+        model.train()
+        for m in model.modules():
+            if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
+                m.reset_running_stats()
+        seen = 0
+        for x, _ in loader:
+            if seen >= num_batches:
+                break
+            if isinstance(x, list):
+                x[0] = x[0].to(self.device)
+                bs = x[0].size(0)
+            else:
+                x = x.to(self.device)
+                bs = x.size(0)
+            if bs <= 1:
+                continue
+            model(x)
+            seen += 1
         model.eval()
 
+    @torch.no_grad()
+    def _compute_per_class_accuracy(self, model, dataloader):
+        was_training = model.training
+        model.eval()
         correct = np.zeros(self.num_classes)
         total = np.zeros(self.num_classes)
-
         for x, target in dataloader:
             x = x.to(self.device)
             target = target.to(dtype=torch.int64).to(self.device)
@@ -197,18 +205,12 @@ class FedVKD(object):
                 mask = (target == c)
                 total[c] += mask.sum().item()
                 correct[c] += ((pred == c) & mask).sum().item()
-
         if was_training:
             model.train()
-
-        # 避免除零
         total = np.maximum(total, 1)
         return correct / total
 
-    # ================================================================
-    #                       wandb 上报
-    # ================================================================
-    def _log_wandb(self, round_idx, test_acc, test_loss):
+    def _log_wandb(self, round_idx, test_acc, test_loss, eval_model):
         if not self.use_wandb:
             return
         try:
@@ -223,16 +225,13 @@ class FedVKD(object):
             "server/round": round_idx,
         }
 
-        # 上报 per-class accuracy
-        per_class_acc = self._compute_per_class_accuracy(
-            self.global_model, self.party2loaders_test)
+        per_class_acc = self._compute_per_class_accuracy(eval_model, self.party2loaders_test)
         for c in range(self.num_classes):
             log_dict[f"per_class/class_{c}_acc"] = per_class_acc[c]
         log_dict["per_class/std"] = per_class_acc.std()
         log_dict["per_class/min"] = per_class_acc.min()
         log_dict["per_class/max"] = per_class_acc.max()
 
-        # 上报 client 平均指标
         keys = ["total_loss", "ce_loss", "kd_loss", "alpha",
                 "use_distill", "num_distill_classes",
                 "num_full_distill_classes", "distill_weight_mean"]
@@ -244,36 +243,25 @@ class FedVKD(object):
 
         wandb.log(log_dict, step=round_idx)
 
-    # ================================================================
-    #                       评估
-    # ================================================================
+    # ★ P1：统一的纯 eval 评估（返回 2 个值）
     def compute_accuracy(self, model, dataloader):
-        was_training = False
-        if model.training:
-            model.eval()
-            was_training = True
-
+        was_training = model.training
+        model.eval()
         correct, total = 0, 0
         criterion = nn.CrossEntropyLoss()
         loss_collector = []
         with torch.no_grad():
             for x, target in dataloader:
-                x, target = x.to(self.device), target.to(dtype=torch.int64).to(self.device)
+                x, target = x.to(self.device), target.to(torch.int64).to(self.device)
                 out = model(x)
-                loss = criterion(out, target)
-                _, pred_label = torch.max(out.data, 1)
-                loss_collector.append(loss.item())
-                total += x.data.size()[0]
-                correct += (pred_label == target.data).sum().item()
-            avg_loss = sum(loss_collector) / max(len(loss_collector), 1)
-
+                loss_collector.append(criterion(out, target).item())
+                _, pred = torch.max(out, 1)
+                total += target.size(0)
+                correct += (pred == target).sum().item()
         if was_training:
             model.train()
-        return correct / float(total), avg_loss
+        return correct / float(total), sum(loss_collector) / max(len(loss_collector), 1)
 
-    # ================================================================
-    #                  client 管理 + 通信
-    # ================================================================
     def set_clients(self, clientObj, party2loaders):
         for i in range(self.num_clients):
             dataload = party2loaders[i]
@@ -326,9 +314,6 @@ class FedVKD(object):
                     global_model_w[key] += client_model_w[key] * w
         self.global_model.load_state_dict(global_model_w)
 
-    # ================================================================
-    #                    auto_break 收敛检测
-    # ================================================================
     def check_done(self, acc_lss, top_cnt=100):
         for acc_ls in acc_lss:
             if len(acc_ls) < top_cnt:
