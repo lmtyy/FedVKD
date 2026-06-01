@@ -1,25 +1,5 @@
 """
 flcore/clients/clientvkd.py — FedVKD 客户端（v3: Data-Aware Selective KD）
-
-核心改动：
-  将 vulnerability 机制替换为 Data-Aware Selective KD：
-  - 根据 client 本地数据分布，静态计算每个类的蒸馏权重
-  - 样本数为 0 的类 → 权重 1.0（全力蒸馏）
-  - 样本数不足的类 → 权重 = 1 - n_c / n_avg（按比例蒸馏）
-  - 样本数充足的类 → 权重 0（不蒸馏）
-  - 权重在 __init__ 时一次性计算，训练中不变
-
-删除的模块：
-  - vulnerability 在线计算（_update_vulnerability）
-  - EMA 平滑（ema_mu）
-  - warmup_rounds（数据分布从第 0 轮就已知）
-  - vuln_threshold
-
-保留的模块：
-  - EMA 全局教师模型
-  - Logit-level KD（加权 KL 散度）
-  - Feature-level 对齐
-  - 渐进调度 alpha
 """
 import torch
 import torch.nn as nn
@@ -55,36 +35,24 @@ class clientVKD(object):
         self.beta = args.beta_vkd
 
         # ====== Data-Aware 蒸馏权重（延迟初始化）======
-        # 需要在 server 调用 set_distill_weights() 后才有值
-        self.distill_weights = None  # [C] tensor
+        self.distill_weights = None
         self.last_round_metrics = {}
 
     # ================================================================
     #          Data-Aware 权重计算（由 server 在创建 client 后调用）
     # ================================================================
     def set_distill_weights(self, local_class_counts, global_avg_per_class):
-        """根据本地数据分布计算每个类的蒸馏权重。
-
-        Args:
-            local_class_counts: list/array of length C, 本地每个类的样本数
-            global_avg_per_class: float, 全局平均每类样本数 (total_samples / C / num_clients 的近似)
-        """
+        """根据本地数据分布计算每个类的蒸馏权重。"""
         weights = torch.zeros(self.num_classes, device=self.device)
         for c in range(self.num_classes):
             n_c = local_class_counts[c]
             if n_c == 0:
-                # 完全缺失的类：全力蒸馏
                 weights[c] = 1.0
             elif n_c < global_avg_per_class:
-                # 不足的类：按比例蒸馏
                 weights[c] = max(0.0, 1.0 - n_c / global_avg_per_class)
             else:
-                # 充足的类：不蒸馏
                 weights[c] = 0.0
-
         self.distill_weights = weights
-        print(f"  Client {self.id}: distill_weights = {weights.cpu().numpy().round(3)}, "
-              f"num_distill = {(weights > 0).sum().item()}")
 
     # ================================================================
     #                          主训练循环
@@ -98,11 +66,9 @@ class clientVKD(object):
         start_time = time.time()
         trainloader = data_this_client
         self.model.train()
-        print(f"\n-------------client: {self.id}-------------")
 
         max_local_epochs = self.local_epochs
 
-        # Data-Aware: 只要有蒸馏权重且教师模型存在，就可以蒸馏（无需 warmup）
         use_distill = (self.distill_weights is not None and
                        self.distill_weights.sum() > 1e-6 and
                        self.teacher_model is not None)
@@ -118,7 +84,6 @@ class clientVKD(object):
             last_alpha = alpha_e
             do_kd_this_epoch = (alpha_e > 0)
 
-            epoch_loss_collector = []
             for x, y in trainloader:
                 if isinstance(x, list):
                     x[0] = x[0].to(self.device)
@@ -151,16 +116,11 @@ class clientVKD(object):
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=10.0)
                 self.optimizer.step()
 
-                epoch_loss_collector.append(loss.item())
                 all_total_losses.append(loss.item())
                 all_ce_losses.append(loss_ce.item())
                 all_kd_losses.append(kd_value)
 
-            epoch_loss = sum(epoch_loss_collector) / max(len(epoch_loss_collector), 1)
-            print('Epoch: %d Loss: %f alpha: %.4f distill: %s' % (
-                epoch, epoch_loss, alpha_e, str(do_kd_this_epoch)))
-
-        # ====== 记录指标供 server 上报 wandb ======
+        # ====== 记录指标供 server 上报 ======
         dw = self.distill_weights
         self.last_round_metrics = {
             "total_loss": float(np.mean(all_total_losses)) if all_total_losses else 0.0,
@@ -182,17 +142,17 @@ class clientVKD(object):
     def _logit_kd_loss(self, logit_local, logit_global):
         """Data-Aware 加权 KL 散度：只蒸馏缺失/不足的类。"""
         T = self.T_kd
-        weights = self.distill_weights  # [C]
+        weights = self.distill_weights
 
         p_teacher = F.softmax(logit_global / T, dim=1)
         log_p_student = F.log_softmax(logit_local / T, dim=1)
         log_p_teacher = torch.log(p_teacher + 1e-8)
-        kl_per_class = p_teacher * (log_p_teacher - log_p_student)  # [B, C]
+        kl_per_class = p_teacher * (log_p_teacher - log_p_student)
 
         weight_sum = weights.sum()
         if weight_sum < 1e-6:
             return torch.tensor(0.0, device=logit_local.device)
-        weight_norm = weights / weight_sum  # [C], sum=1
+        weight_norm = weights / weight_sum
 
         weighted_kl = (kl_per_class * weight_norm.unsqueeze(0)).sum(dim=1).mean()
         return weighted_kl * (T ** 2)
@@ -202,15 +162,14 @@ class clientVKD(object):
     # ================================================================
     def _feature_alignment_loss(self, feat_local, feat_global, logit_global):
         """对缺失类样本，强制本地特征对齐全局特征。"""
-        weights = self.distill_weights  # [C]
+        weights = self.distill_weights
 
         if weights.sum() < 1e-6:
             return torch.tensor(0.0, device=feat_local.device)
 
-        prob_global = F.softmax(logit_global, dim=1)  # [B, C]
+        prob_global = F.softmax(logit_global, dim=1)
         weight_norm = weights / (weights.sum() + 1e-8)
-        # 每个样本的蒸馏权重 = 该样本属于缺失类的概率加权
-        sample_weight = (prob_global * weight_norm.unsqueeze(0)).sum(dim=1)  # [B]
+        sample_weight = (prob_global * weight_norm.unsqueeze(0)).sum(dim=1)
 
         feat_local_norm = F.normalize(feat_local, dim=1)
         feat_global_norm = F.normalize(feat_global, dim=1)

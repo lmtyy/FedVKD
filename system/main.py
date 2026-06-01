@@ -33,6 +33,7 @@ from flcore.servers.serverexp import FedEXP
 from flcore.servers.serverprox import FedProx
 from flcore.servers.servermoon import MOON
 from flcore.servers.servervkd import FedVKD
+from flcore.servers.serverccvr import CCVR
 
 from flcore.trainmodel.models import *
 from flcore.trainmodel.resnetcifar import *
@@ -224,6 +225,10 @@ def run(args):
         elif args.algorithm == "MOON":
             args.model, args.head = _wrap_with_base_head(args.model)
             server = MOON(args, run_idx, party2loaders, global_train_dl, test_dl)
+        
+        elif args.algorithm == "CCVR":
+            args.model, args.head = _wrap_with_base_head(args.model)
+            server = CCVR(args, run_idx, party2loaders, global_train_dl, test_dl)
 
         else:
             raise NotImplementedError
@@ -439,7 +444,7 @@ if __name__ == "__main__":
         print("ema_mu : {}".format(args.ema_mu))
         print("warmup_rounds : {}".format(args.warmup_rounds))
         print("vuln_threshold : {}".format(args.vuln_threshold))
-
+   
     print("=" * 50)
 
     run(args)
