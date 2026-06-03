@@ -2,6 +2,9 @@
 flcore/servers/serverccvr.py — CCVR 病根诊断（NeurIPS 2021）
 诊断目的：判断 non-IID 下精度瓶颈到底在 classifier head 还是 feature。
 流程：正常 FedAvg 训练 → 冻结 base → 用每类特征高斯采样虚拟特征 → 重训 head → 对比。
+
+★ 方案B对齐：诊断前先用 global_train_dl 重校准 BN（num_batches 默认 50，与训练评估口径一致），
+  否则 base 抽出的特征 + acc_before 都被污染的 BN 带偏，会把 head 重训的 Δ 虚高，误判病根在 head。
 """
 import torch
 import torch.nn as nn
@@ -27,6 +30,11 @@ class CCVR(FedAvg):
         print("\n" + "=" * 60)
         print("[CCVR 诊断] FedAvg 训练完成，开始病根诊断")
         print("=" * 60)
+
+        # ★ 方案B：诊断前先重校准 BN（就地修改 self.global_model）。
+        #   num_batches 沿用 recalibrate_bn 默认值 50，与训练时评估口径一致。
+        #   这样 acc_before / 特征统计 / acc_after 全部基于干净 BN，对比才公平。
+        self.recalibrate_bn(self.global_model, self.global_train_dl)
 
         # ===== 2. 诊断前：原 head 的整体 + per-class 精度 =====
         acc_before, pc_before = self._eval_per_class(self.global_model)
