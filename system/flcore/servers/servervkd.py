@@ -45,9 +45,10 @@ class FedVKD(object):
         self.rs_train_loss = []
         self.Budget = []
 
-        self.best_acc = 0.0
+        self.best_acc = -1.0
         self.best_round = -1
         self.best_model_state = None
+        self.best_raw_model_state = None
         self.save_best = getattr(args, "save_best", True)
         self.checkpoint_dir = getattr(args, "checkpoint_dir", "./checkpoints")
 
@@ -121,7 +122,7 @@ class FedVKD(object):
             per_class_acc = self._compute_per_class_accuracy(eval_model, self.party2loaders_test)
 
             self.rs_test_acc.append(test_acc)
-            self._update_best_checkpoint(round_idx, test_acc)
+            self._update_best_checkpoint(round_idx, test_acc, eval_model)
             self.Budget.append(time.time() - s_t)
 
             self._print_round_log(round_idx, test_acc, test_loss, per_class_acc, headcal_metrics)
@@ -434,13 +435,14 @@ class FedVKD(object):
 
         wandb.log(log_dict, step=round_idx)
 
-    def _update_best_checkpoint(self, round_idx, test_acc):
+    def _update_best_checkpoint(self, round_idx, test_acc, eval_model):
         if test_acc <= self.best_acc:
             return
 
         self.best_acc = test_acc
         self.best_round = round_idx
-        self.best_model_state = copy.deepcopy(self.global_model.state_dict())
+        self.best_model_state = copy.deepcopy(eval_model.state_dict())
+        self.best_raw_model_state = copy.deepcopy(self.global_model.state_dict())
 
         if not self.save_best:
             return
@@ -470,12 +472,17 @@ class FedVKD(object):
             "round": self.best_round,
             "best_acc": self.best_acc,
             "model_state": self.best_model_state,
+            "raw_model_state": self.best_raw_model_state,
+            "state_note": (
+                "model_state is BN-recalibrated eval_model used for reported best_acc; "
+                "raw_model_state is the non-recalibrated aggregated global_model."
+            ),
             "args": safe_args,
         }, ckpt_path)
 
         print(
             f"[Checkpoint] New best {self.best_acc*100:.2f}% "
-            f"at round {round_idx}, saved to {ckpt_path}"
+            f"at round {round_idx}, saved BN-recalibrated eval model to {ckpt_path}"
         )
 
     def set_clients(self, clientObj, party2loaders):
