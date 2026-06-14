@@ -381,9 +381,9 @@ if __name__ == "__main__":
     # ===== HeadCal =====
     parser.add_argument('--use_headcal', type=str2bool, default=False,
                         help='Enable HeadCal after FedVKD aggregation')
-    parser.add_argument('--headcal_start_round', type=int, default=0,
-                        help='Start HeadCal after this round')
-    parser.add_argument('--headcal_interval', type=int, default=1,
+    parser.add_argument('--headcal_start_round', type=int, default=-1,
+                        help='Start HeadCal after this round. -1 means use warmup_rounds.')
+    parser.add_argument('--headcal_interval', type=int, default=5,
                         help='Run HeadCal every N rounds')
     parser.add_argument('--headcal_epochs', type=int, default=5,
                         help='HeadCal head-only training epochs')
@@ -395,6 +395,10 @@ if __name__ == "__main__":
                         help='Balanced feature samples per class for HeadCal')
     parser.add_argument('--headcal_batch_size', type=int, default=256,
                         help='HeadCal mini-batch size')
+    parser.add_argument('--save_best', type=str2bool, default=True,
+                        help='Whether to save best checkpoint')
+    parser.add_argument('--checkpoint_dir', type=str, default='./checkpoints',
+                        help='Directory to save best checkpoints')
 
     # ===== WandB =====
     parser.add_argument('--use_wandb', action='store_true', default=False,
@@ -407,6 +411,9 @@ if __name__ == "__main__":
                         help='run 名称（留空自动生成）')
 
     args = parser.parse_args()
+
+    if args.algorithm == "FedVKDHeadCal":
+        args.use_headcal = True
 
     os.environ["CUDA_VISIBLE_DEVICES"] = args.device_id
 
@@ -457,8 +464,6 @@ if __name__ == "__main__":
     elif args.algorithm == "FedMR":
         print("the coefficient of deco loss : {}".format(args.mu))
     elif args.algorithm in ["FedVKD", "FedVKDHeadCal"]:
-        if args.algorithm == "FedVKDHeadCal":
-            args.use_headcal = True
         print("alpha_0 : {}".format(args.alpha_0))
         print("temperature_kd : {}".format(args.temperature_kd))
         print("gamma_schedule : {}".format(args.gamma_schedule))
@@ -471,7 +476,11 @@ if __name__ == "__main__":
         print("headcal_interval : {}".format(args.headcal_interval))
         print("headcal_epochs : {}".format(args.headcal_epochs))
         print("headcal_lr : {}".format(args.headcal_lr))
+        print("headcal_batch_size : {}".format(args.headcal_batch_size))
+        print("headcal_weight_decay : {}".format(args.headcal_weight_decay))
         print("headcal_samples_per_class : {}".format(args.headcal_samples_per_class))
+        print("save_best : {}".format(args.save_best))
+        print("checkpoint_dir : {}".format(args.checkpoint_dir))
    
     print("=" * 50)
 

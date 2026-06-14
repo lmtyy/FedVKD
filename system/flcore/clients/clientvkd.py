@@ -128,7 +128,10 @@ class clientVKD(object):
                 all_feat_kd_losses.append(feat_kd_value)
 
         dw = self.distill_weights
-        effective_weights = last_effective_weights if last_effective_weights is not None else self._effective_distill_weights()
+        if use_distill and last_effective_weights is not None:
+            effective_weights = last_effective_weights
+        else:
+            effective_weights = None
         self.last_round_metrics = {
             "total_loss": float(np.mean(all_total_losses)) if all_total_losses else 0.0,
             "ce_loss": float(np.mean(all_ce_losses)) if all_ce_losses else 0.0,
@@ -141,6 +144,8 @@ class clientVKD(object):
             "num_effective_distill_classes": int((effective_weights > 0).sum().item()) if effective_weights is not None else 0,
             "num_vulnerable_classes": int((self.class_vulnerability_ema >= self.vuln_threshold).sum().item()),
             "distill_weight_mean": float(dw.mean().item()) if dw is not None else 0.0,
+            "effective_weight_mean": float(effective_weights.mean().item()) if effective_weights is not None else 0.0,
+            "effective_weight_max": float(effective_weights.max().item()) if effective_weights is not None else 0.0,
             "vulnerability_mean": float(self.class_vulnerability_ema.mean().item()),
             "vulnerability_max": float(self.class_vulnerability_ema.max().item()),
         }
@@ -160,10 +165,25 @@ class clientVKD(object):
     def _effective_distill_weights(self):
         if self.distill_weights is None:
             return None
-        vuln_gate = (self.class_vulnerability_ema >= self.vuln_threshold).float()
-        effective = self.distill_weights * vuln_gate
+
+        if self.distill_weights.sum() < 1e-8:
+            return torch.zeros_like(self.distill_weights)
+
+        vuln = self.class_vulnerability_ema.detach()
+        if vuln.max() > 1e-8:
+            vuln_norm = vuln / (vuln.max() + 1e-8)
+        else:
+            vuln_norm = torch.zeros_like(vuln)
+
+        above_threshold = (vuln >= self.vuln_threshold).float()
+        soft_factor = (
+            (1.0 - above_threshold) * (0.25 + 0.25 * vuln_norm)
+            + above_threshold * (0.50 + 0.50 * vuln_norm)
+        )
+
+        effective = self.distill_weights * soft_factor
         if effective.sum() < 1e-8 and self.distill_weights.sum() > 1e-8:
-            effective = self.distill_weights
+            effective = 0.25 * self.distill_weights
         return effective
 
     def _logit_kd_loss(self, logit_local, logit_global, effective_weights):

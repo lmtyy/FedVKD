@@ -2,6 +2,7 @@
 flcore/servers/servervkd.py — FedVKD 服务端（Selective KD + optional HeadCal）
 """
 import copy
+import os
 import time
 
 import numpy as np
@@ -43,6 +44,12 @@ class FedVKD(object):
         self.rs_test_acc = []
         self.rs_train_loss = []
         self.Budget = []
+
+        self.best_acc = 0.0
+        self.best_round = -1
+        self.best_model_state = None
+        self.save_best = getattr(args, "save_best", True)
+        self.checkpoint_dir = getattr(args, "checkpoint_dir", "./checkpoints")
 
         self.times = times
         self.party2loaders_train = party2loaders
@@ -114,6 +121,7 @@ class FedVKD(object):
             per_class_acc = self._compute_per_class_accuracy(eval_model, self.party2loaders_test)
 
             self.rs_test_acc.append(test_acc)
+            self._update_best_checkpoint(round_idx, test_acc)
             self.Budget.append(time.time() - s_t)
 
             self._print_round_log(round_idx, test_acc, test_loss, per_class_acc, headcal_metrics)
@@ -123,7 +131,7 @@ class FedVKD(object):
                 break
 
         if self.rs_test_acc:
-            print(f"\nBest accuracy: {max(self.rs_test_acc):.4f}")
+            print(f"\nBest accuracy: {self.best_acc:.4f} at round {self.best_round}")
         else:
             print("\nNo accuracy recorded.")
         print("\nAverage time cost per round.")
@@ -137,12 +145,21 @@ class FedVKD(object):
     def _should_run_headcal(self, round_idx):
         if not getattr(self.args, "use_headcal", False):
             return False
-        if round_idx < getattr(self.args, "headcal_start_round", 0):
+
+        start_round = getattr(self.args, "headcal_start_round", -1)
+        if start_round < 0:
+            start_round = getattr(self.args, "warmup_rounds", 0)
+
+        if round_idx < start_round:
             return False
-        interval = max(getattr(self.args, "headcal_interval", 1), 1)
-        return (round_idx - getattr(self.args, "headcal_start_round", 0)) % interval == 0
+        interval = max(getattr(self.args, "headcal_interval", 5), 1)
+        return (round_idx - start_round) % interval == 0
 
     def _run_headcal(self, round_idx):
+        before_model = copy.deepcopy(self.global_model).to(self.device)
+        self.recalibrate_bn(before_model, self.global_train_dl)
+        before_acc, before_loss = self.compute_accuracy(before_model, self.party2loaders_test)
+
         calib_model = copy.deepcopy(self.global_model).to(self.device)
         self.recalibrate_bn(calib_model, self.global_train_dl)
         calib_model.eval()
@@ -183,7 +200,16 @@ class FedVKD(object):
             num_headcal_classes += 1
 
         if not balanced_feats:
-            return {"headcal_ran": 0.0, "headcal_loss": 0.0, "headcal_classes": 0.0}
+            return {
+                "headcal_ran": 0.0,
+                "headcal_loss": 0.0,
+                "headcal_classes": 0.0,
+                "headcal_before_acc": before_acc,
+                "headcal_after_acc": before_acc,
+                "headcal_delta": 0.0,
+                "headcal_before_loss": before_loss,
+                "headcal_after_loss": before_loss,
+            }
 
         balanced_feats = torch.cat(balanced_feats, dim=0).to(self.device)
         balanced_labels = torch.cat(balanced_labels, dim=0).to(self.device)
@@ -215,14 +241,27 @@ class FedVKD(object):
 
         self.global_model.head.load_state_dict(new_head.state_dict())
         avg_loss = float(np.mean(losses)) if losses else 0.0
+
+        after_model = copy.deepcopy(self.global_model).to(self.device)
+        self.recalibrate_bn(after_model, self.global_train_dl)
+        after_acc, after_loss = self.compute_accuracy(after_model, self.party2loaders_test)
+        delta = after_acc - before_acc
+
         print(
-            f"[HeadCal] round={round_idx} ran=1 loss={avg_loss:.4f} "
+            f"[HeadCal] round={round_idx} ran=1 "
+            f"before={before_acc*100:.2f}% after={after_acc*100:.2f}% "
+            f"delta={delta*100:+.2f}pt loss={avg_loss:.4f} "
             f"classes={num_headcal_classes} samples={balanced_feats.size(0)}"
         )
         return {
             "headcal_ran": 1.0,
             "headcal_loss": avg_loss,
             "headcal_classes": float(num_headcal_classes),
+            "headcal_before_acc": before_acc,
+            "headcal_after_acc": after_acc,
+            "headcal_delta": delta,
+            "headcal_before_loss": before_loss,
+            "headcal_after_loss": after_loss,
         }
 
     @torch.no_grad()
@@ -307,13 +346,15 @@ class FedVKD(object):
         avg_effective_cls = self._metric_avg("num_effective_distill_classes")
         avg_vuln_cls = self._metric_avg("num_vulnerable_classes")
         headcal_ran = headcal_metrics.get("headcal_ran", 0.0)
+        headcal_delta = headcal_metrics.get("headcal_delta", 0.0)
 
         print(
             f"Round {round_idx}/{self.global_rounds} | Loss: {test_loss:.4f} | "
             f"Test Acc: {test_acc*100:.2f}% | Best: {best_acc*100:.2f}% | "
             f"alpha={avg_alpha:.3f} distill_cls={avg_distill_cls:.1f} | "
             f"effective_cls={avg_effective_cls:.1f} vuln_cls={avg_vuln_cls:.1f} | "
-            f"HeadCal={headcal_ran:.0f} | Time: {self.Budget[-1]:.1f}s"
+            f"HeadCal={headcal_ran:.0f} Δ={headcal_delta*100:+.2f}pt | "
+            f"Time: {self.Budget[-1]:.1f}s"
         )
 
         is_milestone = (round_idx % 10 == 0) or (round_idx == self.global_rounds - 1)
@@ -336,6 +377,9 @@ class FedVKD(object):
             )
             print(
                 f"    [HeadCal] ran={headcal_metrics.get('headcal_ran', 0.0):.0f} "
+                f"before={headcal_metrics.get('headcal_before_acc', 0.0)*100:.2f}% "
+                f"after={headcal_metrics.get('headcal_after_acc', 0.0)*100:.2f}% "
+                f"delta={headcal_metrics.get('headcal_delta', 0.0)*100:+.2f}pt "
                 f"loss={headcal_metrics.get('headcal_loss', 0.0):.4f} "
                 f"classes={headcal_metrics.get('headcal_classes', 0.0):.0f}"
             )
@@ -356,6 +400,11 @@ class FedVKD(object):
             "headcal/ran": headcal_metrics.get("headcal_ran", 0.0),
             "headcal/loss": headcal_metrics.get("headcal_loss", 0.0),
             "headcal/classes": headcal_metrics.get("headcal_classes", 0.0),
+            "headcal/before_acc": headcal_metrics.get("headcal_before_acc", 0.0),
+            "headcal/after_acc": headcal_metrics.get("headcal_after_acc", 0.0),
+            "headcal/delta": headcal_metrics.get("headcal_delta", 0.0),
+            "headcal/before_loss": headcal_metrics.get("headcal_before_loss", 0.0),
+            "headcal/after_loss": headcal_metrics.get("headcal_after_loss", 0.0),
             "per_class/std": per_class_acc.std(),
             "per_class/min": per_class_acc.min(),
             "per_class/max": per_class_acc.max(),
@@ -374,6 +423,9 @@ class FedVKD(object):
             "num_distill_classes",
             "num_effective_distill_classes",
             "num_vulnerable_classes",
+            "distill_weight_mean",
+            "effective_weight_mean",
+            "effective_weight_max",
             "vulnerability_mean",
             "vulnerability_max",
         ]
@@ -381,6 +433,50 @@ class FedVKD(object):
             log_dict[f"client/{key}_avg"] = self._metric_avg(key)
 
         wandb.log(log_dict, step=round_idx)
+
+    def _update_best_checkpoint(self, round_idx, test_acc):
+        if test_acc <= self.best_acc:
+            return
+
+        self.best_acc = test_acc
+        self.best_round = round_idx
+        self.best_model_state = copy.deepcopy(self.global_model.state_dict())
+
+        if not self.save_best:
+            return
+
+        os.makedirs(self.checkpoint_dir, exist_ok=True)
+
+        model_name = getattr(self.args, "model_name", None)
+        if model_name is None:
+            model_name = getattr(self.args, "model", "model")
+            if not isinstance(model_name, str):
+                model_name = "model"
+
+        ckpt_name = (
+            f"{self.algorithm}_{self.dataset}_"
+            f"{model_name}_"
+            f"alpha{getattr(self.args, 'alpha', 'na')}_"
+            f"round{round_idx}_best.pt"
+        )
+        ckpt_path = os.path.join(self.checkpoint_dir, ckpt_name)
+
+        safe_args = {
+            key: value for key, value in vars(self.args).items()
+            if isinstance(value, (int, float, str, bool, type(None)))
+        }
+
+        torch.save({
+            "round": self.best_round,
+            "best_acc": self.best_acc,
+            "model_state": self.best_model_state,
+            "args": safe_args,
+        }, ckpt_path)
+
+        print(
+            f"[Checkpoint] New best {self.best_acc*100:.2f}% "
+            f"at round {round_idx}, saved to {ckpt_path}"
+        )
 
     def set_clients(self, clientObj, party2loaders):
         for i in range(self.num_clients):
