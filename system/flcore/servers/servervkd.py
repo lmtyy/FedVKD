@@ -1,19 +1,15 @@
 """
-flcore/servers/servervkd.py — FedVKD 服务端（v3 + P1 方案B BN重校准）
-
-P1 改动：
-1. __init__ 保存 self.global_train_dl
-2. 新增 recalibrate_bn；评估在 global_model 的副本上进行
-3. per-class accuracy / wandb 全部基于重校准后的 eval_model，口径统一
-4. compute_accuracy 统一为纯 eval
+flcore/servers/servervkd.py — FedVKD 服务端（Selective KD + optional HeadCal）
 """
-import time
 import copy
+import time
+
+import numpy as np
 import torch
 import torch.nn as nn
-import numpy as np
 
 from flcore.clients.clientvkd import clientVKD
+
 
 class FedVKD(object):
     def __init__(self, args, times, party2loaders, global_train_dl, test_dl):
@@ -25,7 +21,7 @@ class FedVKD(object):
         self.local_epochs = args.local_epochs
         self.batch_size = args.batch_size
         self.global_model = copy.deepcopy(args.model)
-        self.teacher_model = None
+        self.global_train_dl = global_train_dl
 
         self.num_clients = args.num_clients
         self.join_ratio = args.join_ratio
@@ -40,63 +36,58 @@ class FedVKD(object):
 
         self.clients = []
         self.selected_clients = []
-
         self.uploaded_weights = []
         self.uploaded_ids = []
         self.uploaded_models = []
 
         self.rs_test_acc = []
-        self.rs_test_auc = []
         self.rs_train_loss = []
+        self.Budget = []
 
         self.times = times
         self.party2loaders_train = party2loaders
         self.party2loaders_test = test_dl
-        self.global_train_dl = global_train_dl       # ★ P1: BN 重校准用全局训练集
+
+        self.use_wandb = getattr(args, "use_wandb", False)
+        self.use_headcal = getattr(args, "use_headcal", False)
 
         self.set_clients(clientVKD, party2loaders)
-
-        # ★ Data-Aware: 初始化每个 client 的蒸馏权重
         self._init_distill_weights(party2loaders)
 
         print(f"\nJoin ratio / total clients: {self.join_ratio} / {self.num_clients}")
+        print(f"HeadCal enabled: {self.use_headcal}")
         print("Finished creating FedVKD server and clients.")
 
-        self.Budget = []
-        self.use_wandb = getattr(args, 'use_wandb', False)
-
-    # ================================================================
-    #          Data-Aware: 计算每个 client 的蒸馏权重
-    # ================================================================
     def _init_distill_weights(self, party2loaders):
         print("\n[Data-Aware] Computing distillation weights per client...")
         client_class_counts = np.zeros((self.num_clients, self.num_classes))
+
         for cid in range(self.num_clients):
             loader = party2loaders[cid]
             for _, targets in loader:
-                for t in targets.numpy():
-                    client_class_counts[cid][t] += 1
+                targets = targets.detach().cpu().numpy()
+                for t in targets:
+                    client_class_counts[cid][int(t)] += 1
 
         total_samples = client_class_counts.sum()
-        global_avg_per_class = total_samples / self.num_classes / self.num_clients
-        print(f"[Data-Aware] Total samples: {int(total_samples)}, "
-              f"Global avg per class per client: {global_avg_per_class:.1f}")
+        global_avg_per_class = total_samples / max(self.num_classes * self.num_clients, 1)
+        print(f"[Data-Aware] Total samples: {int(total_samples)}")
+        print(f"[Data-Aware] Global avg per class per client: {global_avg_per_class:.1f}")
 
         for cid, client in enumerate(self.clients):
             client.set_distill_weights(
                 local_class_counts=client_class_counts[cid],
-                global_avg_per_class=global_avg_per_class
+                global_avg_per_class=global_avg_per_class,
             )
 
         all_weights = torch.stack([c.distill_weights for c in self.clients])
         avg_num_distill = (all_weights > 0).float().sum(dim=1).mean().item()
         avg_num_full = (all_weights >= 0.99).float().sum(dim=1).mean().item()
-        print(f"[Data-Aware] Avg distill classes per client: {avg_num_distill:.1f} "
-              f"(full: {avg_num_full:.1f}) / {self.num_classes}")
+        print(
+            f"[Data-Aware] Avg distill classes per client: {avg_num_distill:.1f} "
+            f"(full: {avg_num_full:.1f}) / {self.num_classes}"
+        )
 
-    # ================================================================
-    #                       主训练循环
-    # ================================================================
     def train(self):
         for round_idx in range(self.global_rounds):
             s_t = time.time()
@@ -113,44 +104,20 @@ class FedVKD(object):
             self.receive_models()
             self.aggregate_parameters()
 
-            print("\nEvaluate aggregated global model")
-            # ★ P1: 副本重校准 BN，后续所有评估都用 eval_model
+            headcal_metrics = {}
+            if self._should_run_headcal(round_idx):
+                headcal_metrics = self._run_headcal(round_idx)
+
             eval_model = copy.deepcopy(self.global_model)
             self.recalibrate_bn(eval_model, self.global_train_dl)
             test_acc, test_loss = self.compute_accuracy(eval_model, self.party2loaders_test)
+            per_class_acc = self._compute_per_class_accuracy(eval_model, self.party2loaders_test)
 
             self.rs_test_acc.append(test_acc)
             self.Budget.append(time.time() - s_t)
 
-            if round_idx % 10 == 0 or round_idx == self.global_rounds - 1:
-                best_acc = max(self.rs_test_acc)
-                per_class_acc = self._compute_per_class_accuracy(eval_model, self.party2loaders_test)
-                per_class_str = " ".join([f"{a:.1f}" for a in (per_class_acc * 100)])
-                std_acc = per_class_acc.std().item() * 100
-
-                avg_kd = np.mean([c.last_round_metrics.get("kd_loss", 0)
-                                  for c in self.selected_clients])
-                avg_ce = np.mean([c.last_round_metrics.get("ce_loss", 0)
-                                  for c in self.selected_clients])
-                avg_distill_cls = np.mean([c.last_round_metrics.get("num_distill_classes", 0)
-                                           for c in self.selected_clients])
-
-                print(f"Round {round_idx}/{self.global_rounds} | "
-                      f"Test Acc: {test_acc*100:.2f}% | Best: {best_acc*100:.2f}% | "
-                      f"distill_cls={avg_distill_cls:.1f} | Time: {self.Budget[-1]:.1f}s")
-                print(f"    [DIAG] per_class_acc=[{per_class_str}] std={std_acc:.2f} | "
-                      f"kd_loss={avg_kd:.4f} ce_loss={avg_ce:.4f}")
-            else:
-                avg_alpha = np.mean([c.last_round_metrics.get("alpha", 0)
-                                     for c in self.selected_clients])
-                avg_distill_cls = np.mean([c.last_round_metrics.get("num_distill_classes", 0)
-                                           for c in self.selected_clients])
-                print(f"Round {round_idx}/{self.global_rounds} | "
-                      f"Loss: {test_loss:.4f} | Test: {test_acc*100:.2f}% | "
-                      f"α={avg_alpha:.3f} distill_cls={avg_distill_cls:.1f} | "
-                      f"Time: {self.Budget[-1]:.1f}s")
-
-            self._log_wandb(round_idx, test_acc, test_loss, eval_model)
+            self._print_round_log(round_idx, test_acc, test_loss, per_class_acc, headcal_metrics)
+            self._log_wandb(round_idx, test_acc, test_loss, per_class_acc, headcal_metrics)
 
             if self.auto_break and self.check_done(acc_lss=[self.rs_test_acc], top_cnt=self.top_cnt):
                 break
@@ -167,28 +134,140 @@ class FedVKD(object):
         else:
             print(0.0)
 
-    # ★ P1 核心：BN 重校准
+    def _should_run_headcal(self, round_idx):
+        if not getattr(self.args, "use_headcal", False):
+            return False
+        if round_idx < getattr(self.args, "headcal_start_round", 0):
+            return False
+        interval = max(getattr(self.args, "headcal_interval", 1), 1)
+        return (round_idx - getattr(self.args, "headcal_start_round", 0)) % interval == 0
+
+    def _run_headcal(self, round_idx):
+        calib_model = copy.deepcopy(self.global_model).to(self.device)
+        self.recalibrate_bn(calib_model, self.global_train_dl)
+        calib_model.eval()
+
+        for param in calib_model.base.parameters():
+            param.requires_grad = False
+
+        feats_by_class = {c: [] for c in range(self.num_classes)}
+        with torch.no_grad():
+            for x, y in self.global_train_dl:
+                if isinstance(x, list):
+                    x = x[0]
+                x = x.to(self.device)
+                y = y.long().to(self.device)
+                feat = calib_model.base(x).detach().cpu()
+                y_cpu = y.detach().cpu()
+                for c in range(self.num_classes):
+                    mask = (y_cpu == c)
+                    if mask.sum() > 0:
+                        feats_by_class[c].append(feat[mask])
+
+        balanced_feats = []
+        balanced_labels = []
+        samples_per_class = getattr(self.args, "headcal_samples_per_class", 256)
+        num_headcal_classes = 0
+
+        for c in range(self.num_classes):
+            if len(feats_by_class[c]) == 0:
+                continue
+            class_feats = torch.cat(feats_by_class[c], dim=0)
+            n = class_feats.size(0)
+            if n >= samples_per_class:
+                idx = torch.randperm(n)[:samples_per_class]
+            else:
+                idx = torch.randint(0, n, (samples_per_class,))
+            balanced_feats.append(class_feats[idx])
+            balanced_labels.append(torch.full((samples_per_class,), c, dtype=torch.long))
+            num_headcal_classes += 1
+
+        if not balanced_feats:
+            return {"headcal_ran": 0.0, "headcal_loss": 0.0, "headcal_classes": 0.0}
+
+        balanced_feats = torch.cat(balanced_feats, dim=0).to(self.device)
+        balanced_labels = torch.cat(balanced_labels, dim=0).to(self.device)
+
+        new_head = copy.deepcopy(calib_model.head).to(self.device)
+        new_head.train()
+        optimizer = torch.optim.SGD(
+            new_head.parameters(),
+            lr=getattr(self.args, "headcal_lr", 0.01),
+            momentum=0.9,
+            weight_decay=getattr(self.args, "headcal_weight_decay", 0.0),
+        )
+        criterion = nn.CrossEntropyLoss()
+        batch_size = max(getattr(self.args, "headcal_batch_size", 256), 1)
+        losses = []
+
+        for _ in range(getattr(self.args, "headcal_epochs", 5)):
+            perm = torch.randperm(balanced_feats.size(0), device=self.device)
+            for start in range(0, balanced_feats.size(0), batch_size):
+                idx = perm[start:start + batch_size]
+                xb = balanced_feats[idx]
+                yb = balanced_labels[idx]
+                optimizer.zero_grad()
+                logits = new_head(xb)
+                loss = criterion(logits, yb)
+                loss.backward()
+                optimizer.step()
+                losses.append(loss.item())
+
+        self.global_model.head.load_state_dict(new_head.state_dict())
+        avg_loss = float(np.mean(losses)) if losses else 0.0
+        print(
+            f"[HeadCal] round={round_idx} ran=1 loss={avg_loss:.4f} "
+            f"classes={num_headcal_classes} samples={balanced_feats.size(0)}"
+        )
+        return {
+            "headcal_ran": 1.0,
+            "headcal_loss": avg_loss,
+            "headcal_classes": float(num_headcal_classes),
+        }
+
     @torch.no_grad()
     def recalibrate_bn(self, model, loader, num_batches=50):
         model.train()
-        for m in model.modules():
-            if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
-                m.reset_running_stats()
+        for module in model.modules():
+            if isinstance(module, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
+                module.reset_running_stats()
+
         seen = 0
         for x, _ in loader:
             if seen >= num_batches:
                 break
             if isinstance(x, list):
-                x[0] = x[0].to(self.device)
-                bs = x[0].size(0)
-            else:
-                x = x.to(self.device)
-                bs = x.size(0)
-            if bs <= 1:
+                x = x[0]
+            x = x.to(self.device)
+            if x.size(0) <= 1:
                 continue
             model(x)
             seen += 1
         model.eval()
+
+    def compute_accuracy(self, model, dataloader):
+        was_training = model.training
+        model.eval()
+        correct, total = 0, 0
+        criterion = nn.CrossEntropyLoss()
+        losses = []
+
+        with torch.no_grad():
+            for x, target in dataloader:
+                if isinstance(x, list):
+                    x = x[0]
+                x = x.to(self.device)
+                target = target.to(torch.int64).to(self.device)
+                out = model(x)
+                loss = criterion(out, target)
+                losses.append(loss.item())
+                pred = out.argmax(dim=1)
+                total += target.size(0)
+                correct += (pred == target).sum().item()
+
+        if was_training:
+            model.train()
+        return correct / max(float(total), 1.0), sum(losses) / max(len(losses), 1)
 
     @torch.no_grad()
     def _compute_per_class_accuracy(self, model, dataloader):
@@ -196,21 +275,72 @@ class FedVKD(object):
         model.eval()
         correct = np.zeros(self.num_classes)
         total = np.zeros(self.num_classes)
+
         for x, target in dataloader:
+            if isinstance(x, list):
+                x = x[0]
             x = x.to(self.device)
-            target = target.to(dtype=torch.int64).to(self.device)
+            target = target.to(torch.int64).to(self.device)
             out = model(x)
-            _, pred = torch.max(out, 1)
+            pred = out.argmax(dim=1)
             for c in range(self.num_classes):
                 mask = (target == c)
                 total[c] += mask.sum().item()
                 correct[c] += ((pred == c) & mask).sum().item()
+
         if was_training:
             model.train()
-        total = np.maximum(total, 1)
-        return correct / total
+        return correct / np.maximum(total, 1)
 
-    def _log_wandb(self, round_idx, test_acc, test_loss, eval_model):
+    def _metric_avg(self, key):
+        vals = [
+            client.last_round_metrics.get(key, 0.0)
+            for client in self.selected_clients
+            if hasattr(client, "last_round_metrics")
+        ]
+        return float(np.mean(vals)) if vals else 0.0
+
+    def _print_round_log(self, round_idx, test_acc, test_loss, per_class_acc, headcal_metrics):
+        best_acc = max(self.rs_test_acc) if self.rs_test_acc else test_acc
+        avg_alpha = self._metric_avg("alpha")
+        avg_distill_cls = self._metric_avg("num_distill_classes")
+        avg_effective_cls = self._metric_avg("num_effective_distill_classes")
+        avg_vuln_cls = self._metric_avg("num_vulnerable_classes")
+        headcal_ran = headcal_metrics.get("headcal_ran", 0.0)
+
+        print(
+            f"Round {round_idx}/{self.global_rounds} | Loss: {test_loss:.4f} | "
+            f"Test Acc: {test_acc*100:.2f}% | Best: {best_acc*100:.2f}% | "
+            f"alpha={avg_alpha:.3f} distill_cls={avg_distill_cls:.1f} | "
+            f"effective_cls={avg_effective_cls:.1f} vuln_cls={avg_vuln_cls:.1f} | "
+            f"HeadCal={headcal_ran:.0f} | Time: {self.Budget[-1]:.1f}s"
+        )
+
+        is_milestone = (round_idx % 10 == 0) or (round_idx == self.global_rounds - 1)
+        if is_milestone:
+            per_class_str = " ".join([f"{acc * 100:.1f}" for acc in per_class_acc])
+            print(
+                f"    [DIAG] per_class_acc=[{per_class_str}] "
+                f"std={per_class_acc.std()*100:.2f} min={per_class_acc.min()*100:.2f} "
+                f"max={per_class_acc.max()*100:.2f}"
+            )
+            print(
+                f"    [DIAG] ce_loss={self._metric_avg('ce_loss'):.4f} "
+                f"kd_loss={self._metric_avg('kd_loss'):.4f} "
+                f"logit_kd={self._metric_avg('logit_kd_loss'):.4f} "
+                f"feat_kd={self._metric_avg('feat_kd_loss'):.4f}"
+            )
+            print(
+                f"    [DIAG] vulnerability_mean={self._metric_avg('vulnerability_mean'):.4f} "
+                f"vulnerability_max={self._metric_avg('vulnerability_max'):.4f}"
+            )
+            print(
+                f"    [HeadCal] ran={headcal_metrics.get('headcal_ran', 0.0):.0f} "
+                f"loss={headcal_metrics.get('headcal_loss', 0.0):.4f} "
+                f"classes={headcal_metrics.get('headcal_classes', 0.0):.0f}"
+            )
+
+    def _log_wandb(self, round_idx, test_acc, test_loss, per_class_acc, headcal_metrics):
         if not self.use_wandb:
             return
         try:
@@ -223,44 +353,34 @@ class FedVKD(object):
             "server/test_loss": test_loss,
             "server/best_acc": max(self.rs_test_acc) if self.rs_test_acc else test_acc,
             "server/round": round_idx,
+            "headcal/ran": headcal_metrics.get("headcal_ran", 0.0),
+            "headcal/loss": headcal_metrics.get("headcal_loss", 0.0),
+            "headcal/classes": headcal_metrics.get("headcal_classes", 0.0),
+            "per_class/std": per_class_acc.std(),
+            "per_class/min": per_class_acc.min(),
+            "per_class/max": per_class_acc.max(),
         }
-
-        per_class_acc = self._compute_per_class_accuracy(eval_model, self.party2loaders_test)
         for c in range(self.num_classes):
             log_dict[f"per_class/class_{c}_acc"] = per_class_acc[c]
-        log_dict["per_class/std"] = per_class_acc.std()
-        log_dict["per_class/min"] = per_class_acc.min()
-        log_dict["per_class/max"] = per_class_acc.max()
 
-        keys = ["total_loss", "ce_loss", "kd_loss", "alpha",
-                "use_distill", "num_distill_classes",
-                "num_full_distill_classes", "distill_weight_mean"]
-        for k in keys:
-            vals = [c.last_round_metrics[k] for c in self.selected_clients
-                    if hasattr(c, 'last_round_metrics') and k in c.last_round_metrics]
-            if vals:
-                log_dict[f"client/{k}_avg"] = float(np.mean(vals))
+        keys = [
+            "total_loss",
+            "ce_loss",
+            "kd_loss",
+            "logit_kd_loss",
+            "feat_kd_loss",
+            "alpha",
+            "use_distill",
+            "num_distill_classes",
+            "num_effective_distill_classes",
+            "num_vulnerable_classes",
+            "vulnerability_mean",
+            "vulnerability_max",
+        ]
+        for key in keys:
+            log_dict[f"client/{key}_avg"] = self._metric_avg(key)
 
         wandb.log(log_dict, step=round_idx)
-
-    # ★ P1：统一的纯 eval 评估（返回 2 个值）
-    def compute_accuracy(self, model, dataloader):
-        was_training = model.training
-        model.eval()
-        correct, total = 0, 0
-        criterion = nn.CrossEntropyLoss()
-        loss_collector = []
-        with torch.no_grad():
-            for x, target in dataloader:
-                x, target = x.to(self.device), target.to(torch.int64).to(self.device)
-                out = model(x)
-                loss_collector.append(criterion(out, target).item())
-                _, pred = torch.max(out, 1)
-                total += target.size(0)
-                correct += (pred == target).sum().item()
-        if was_training:
-            model.train()
-        return correct / float(total), sum(loss_collector) / max(len(loss_collector), 1)
 
     def set_clients(self, clientObj, party2loaders):
         for i in range(self.num_clients):
@@ -271,11 +391,11 @@ class FedVKD(object):
     def select_clients(self):
         if self.random_join_ratio:
             self.current_num_join_clients = np.random.choice(
-                range(self.num_join_clients, self.num_clients + 1), 1, replace=False)[0]
+                range(self.num_join_clients, self.num_clients + 1), 1, replace=False
+            )[0]
         else:
             self.current_num_join_clients = self.num_join_clients
-        selected = list(np.random.choice(self.clients, self.current_num_join_clients, replace=False))
-        return selected
+        return list(np.random.choice(self.clients, self.current_num_join_clients, replace=False))
 
     def send_models(self):
         assert len(self.clients) > 0
@@ -296,22 +416,22 @@ class FedVKD(object):
             self.uploaded_ids.append(client.id)
             self.uploaded_weights.append(client.train_samples)
             self.uploaded_models.append(client.model)
-        for i, w in enumerate(self.uploaded_weights):
-            self.uploaded_weights[i] = w / tot_samples
+        for i, weight in enumerate(self.uploaded_weights):
+            self.uploaded_weights[i] = weight / tot_samples
 
     def aggregate_parameters(self):
         assert len(self.uploaded_models) > 0
         global_model_w = self.global_model.state_dict()
         first = True
-        for w, client_model in zip(self.uploaded_weights, self.uploaded_models):
+        for weight, client_model in zip(self.uploaded_weights, self.uploaded_models):
             client_model_w = client_model.state_dict()
             if first:
                 for key in client_model_w:
-                    global_model_w[key] = client_model_w[key] * w
+                    global_model_w[key] = client_model_w[key] * weight
                 first = False
             else:
                 for key in client_model_w:
-                    global_model_w[key] += client_model_w[key] * w
+                    global_model_w[key] += client_model_w[key] * weight
         self.global_model.load_state_dict(global_model_w)
 
     def check_done(self, acc_lss, top_cnt=100):

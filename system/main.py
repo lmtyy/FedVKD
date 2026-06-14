@@ -194,8 +194,10 @@ def run(args):
             args.model, args.head = _wrap_with_base_head(args.model)
             server = FedVLS(args, run_idx, party2loaders, global_train_dl, test_dl)
 
-        elif args.algorithm == "FedVKD":
+        elif args.algorithm in ["FedVKD", "FedVKDHeadCal"]:
             args.model, args.head = _wrap_with_base_head(args.model)
+            if args.algorithm == "FedVKDHeadCal":
+                args.use_headcal = True
             server = FedVKD(args, run_idx, party2loaders, global_train_dl, test_dl)
 
         elif args.algorithm == "FedMR":
@@ -376,6 +378,24 @@ if __name__ == "__main__":
     parser.add_argument('--vuln_threshold', type=float, default=0.05,
                         help='FedVKD: 脆弱度激活阈值（绝对概率差）')
 
+    # ===== HeadCal =====
+    parser.add_argument('--use_headcal', type=str2bool, default=False,
+                        help='Enable HeadCal after FedVKD aggregation')
+    parser.add_argument('--headcal_start_round', type=int, default=0,
+                        help='Start HeadCal after this round')
+    parser.add_argument('--headcal_interval', type=int, default=1,
+                        help='Run HeadCal every N rounds')
+    parser.add_argument('--headcal_epochs', type=int, default=5,
+                        help='HeadCal head-only training epochs')
+    parser.add_argument('--headcal_lr', type=float, default=0.01,
+                        help='HeadCal learning rate')
+    parser.add_argument('--headcal_weight_decay', type=float, default=0.0,
+                        help='HeadCal head optimizer weight decay')
+    parser.add_argument('--headcal_samples_per_class', type=int, default=256,
+                        help='Balanced feature samples per class for HeadCal')
+    parser.add_argument('--headcal_batch_size', type=int, default=256,
+                        help='HeadCal mini-batch size')
+
     # ===== WandB =====
     parser.add_argument('--use_wandb', action='store_true', default=False,
                         help='是否启用 wandb 日志')
@@ -436,7 +456,9 @@ if __name__ == "__main__":
         print("the coefficient of NTD loss : {}".format(args.beta))
     elif args.algorithm == "FedMR":
         print("the coefficient of deco loss : {}".format(args.mu))
-    elif args.algorithm == "FedVKD":
+    elif args.algorithm in ["FedVKD", "FedVKDHeadCal"]:
+        if args.algorithm == "FedVKDHeadCal":
+            args.use_headcal = True
         print("alpha_0 : {}".format(args.alpha_0))
         print("temperature_kd : {}".format(args.temperature_kd))
         print("gamma_schedule : {}".format(args.gamma_schedule))
@@ -444,6 +466,12 @@ if __name__ == "__main__":
         print("ema_mu : {}".format(args.ema_mu))
         print("warmup_rounds : {}".format(args.warmup_rounds))
         print("vuln_threshold : {}".format(args.vuln_threshold))
+        print("use_headcal : {}".format(args.use_headcal))
+        print("headcal_start_round : {}".format(args.headcal_start_round))
+        print("headcal_interval : {}".format(args.headcal_interval))
+        print("headcal_epochs : {}".format(args.headcal_epochs))
+        print("headcal_lr : {}".format(args.headcal_lr))
+        print("headcal_samples_per_class : {}".format(args.headcal_samples_per_class))
    
     print("=" * 50)
 
