@@ -63,7 +63,7 @@ class clientMR(object):
         self.loss = nn.CrossEntropyLoss()
         self.optimizer = torch.optim.SGD(filter(lambda p: p.requires_grad, self.model.parameters()), lr=self.learning_rate, momentum=0.9, weight_decay=self.weight_decay)
         
-        self.criterion_deco = MR_loss().cuda()
+        self.criterion_deco = MR_loss().to(self.device)
     
     def train(self, data_this_client):
         start_time = time.time()

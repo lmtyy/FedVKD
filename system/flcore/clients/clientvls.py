@@ -48,13 +48,13 @@ class clientVLS(object):
                 for label in labels:
                     label = label.item()  
                     self.num_per_class[label] += 1         
-            self.num_per_class = torch.Tensor(self.num_per_class).float().cuda()
+            self.num_per_class = torch.tensor(self.num_per_class, dtype=torch.float32, device=self.device)
             self.prior = self.num_per_class / self.num_per_class.sum()
             self.beta_y = (self.num_per_class / self.num_per_class.max()).pow(0.05)
             self.no_exist_label = torch.where(self.prior == 0)[0]
             self.exist_label = torch.where(self.prior != 0)[0]
-            self.no_exist_label = torch.Tensor(self.no_exist_label).int().cuda()
-            self.exist_label = torch.Tensor(self.exist_label).int().cuda()
+            self.no_exist_label = self.no_exist_label.to(dtype=torch.int64, device=self.device)
+            self.exist_label = self.exist_label.to(dtype=torch.int64, device=self.device)
             self.exist_prior = self.prior[self.exist_label]
         
         self.model.train()
@@ -94,8 +94,8 @@ class clientVLS(object):
         self.teacher_model = copy.deepcopy(model)      
     
     def new_LADEloss(self, y_pred, target): 
-        cls_weight = (self.num_per_class.float() / torch.sum(self.num_per_class.float())).cuda()
-        balanced_prior = torch.tensor(1. / self.num_classes).float().cuda()
+        cls_weight = (self.num_per_class.float() / torch.sum(self.num_per_class.float())).to(self.device)
+        balanced_prior = torch.tensor(1. / self.num_classes, dtype=torch.float32, device=self.device)
         pred_spread = (y_pred - torch.log(self.prior + 1e-9) + torch.log(balanced_prior + 1e-9)).T * (target != torch.arange(0, self.num_classes).view(-1, 1).type_as(target))# C x N
         N = pred_spread.size(-1)
         second_term = torch.logsumexp(pred_spread, -1) - np.log(N)

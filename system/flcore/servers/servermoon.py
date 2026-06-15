@@ -22,7 +22,7 @@ class MOON(object):
         self.num_clients = args.num_clients
         self.join_ratio = args.join_ratio
         self.random_join_ratio = args.random_join_ratio
-        self.num_join_clients = int(self.num_clients * self.join_ratio)
+        self.num_join_clients = min(self.num_clients, max(1, int(self.num_clients * self.join_ratio)))
         self.current_num_join_clients = self.num_join_clients
         self.algorithm = args.algorithm
         self.goal = args.goal
@@ -55,7 +55,7 @@ class MOON(object):
         self.Budget = []
         
         self.global_model = ContrastiveModelWrapper(self.global_model, args.use_proj_head, args.proj_dim)
-        self.global_model.cuda()
+        self.global_model.to(self.device)
         
     def train(self):
         for i in range(self.global_rounds):
@@ -88,15 +88,21 @@ class MOON(object):
 
         print("\nBest accuracy.")
         print(max(self.rs_test_acc))
-        print("\nAveraged time per iteration.")
-        print(sum(self.Budget[1:])/len(self.Budget[1:]))
+        print()
+        print("Average time cost per round.")
+        if len(self.Budget) > 1:
+            print(sum(self.Budget[1:]) / len(self.Budget[1:]))
+        elif self.Budget:
+            print(self.Budget[0])
+        else:
+            print(0.0)
 
     def compute_accuracy(self, model, dataloader):
         was_training = False
         if model.training:
             model.eval()
             was_training = True
-        model.cuda()
+        model.to(self.device)
         correct, total = 0, 0
         criterion = nn.CrossEntropyLoss()
         loss_collector = []

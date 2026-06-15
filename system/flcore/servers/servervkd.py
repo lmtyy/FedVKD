@@ -27,7 +27,7 @@ class FedVKD(object):
         self.num_clients = args.num_clients
         self.join_ratio = args.join_ratio
         self.random_join_ratio = args.random_join_ratio
-        self.num_join_clients = int(self.num_clients * self.join_ratio)
+        self.num_join_clients = min(self.num_clients, max(1, int(self.num_clients * self.join_ratio)))
         self.current_num_join_clients = self.num_join_clients
         self.algorithm = args.algorithm
         self.goal = args.goal
@@ -135,7 +135,8 @@ class FedVKD(object):
             print(f"\nBest accuracy: {self.best_acc:.4f} at round {self.best_round}")
         else:
             print("\nNo accuracy recorded.")
-        print("\nAverage time cost per round.")
+        print()
+        print("Average time cost per round.")
         if len(self.Budget) > 1:
             print(sum(self.Budget[1:]) / len(self.Budget[1:]))
         elif self.Budget:
@@ -169,6 +170,8 @@ class FedVKD(object):
             param.requires_grad = False
 
         feats_by_class = {c: [] for c in range(self.num_classes)}
+        feature_cap_per_class = max(getattr(self.args, "headcal_samples_per_class", 256) * 2, 1)
+        feature_counts = np.zeros(self.num_classes, dtype=np.int64)
         with torch.no_grad():
             for x, y in self.global_train_dl:
                 if isinstance(x, list):
@@ -176,11 +179,18 @@ class FedVKD(object):
                 x = x.to(self.device)
                 y = y.long().to(self.device)
                 feat = calib_model.base(x).detach().cpu()
+                if feat.dim() > 2:
+                    feat = torch.nn.functional.adaptive_avg_pool2d(feat, 1).flatten(1)
                 y_cpu = y.detach().cpu()
                 for c in range(self.num_classes):
+                    if feature_counts[c] >= feature_cap_per_class:
+                        continue
                     mask = (y_cpu == c)
                     if mask.sum() > 0:
-                        feats_by_class[c].append(feat[mask])
+                        selected_feat = feat[mask]
+                        remaining = feature_cap_per_class - feature_counts[c]
+                        feats_by_class[c].append(selected_feat[:remaining])
+                        feature_counts[c] += min(selected_feat.size(0), remaining)
 
         balanced_feats = []
         balanced_labels = []

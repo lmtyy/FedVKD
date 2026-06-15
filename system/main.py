@@ -285,7 +285,8 @@ if __name__ == "__main__":
     parser.add_argument('-did', "--device_id", type=str, default="0")
     parser.add_argument('-data', "--dataset", type=str, default="mnist")
     parser.add_argument('-nb', "--num_classes", type=int, default=10)
-    parser.add_argument('-m', "--model", type=str, default="cnn")
+    parser.add_argument('-m', "--model", type=str, default="dnn",
+                        choices=["dnn", "resnet18", "resnet32", "mobilenetv2"])
     parser.add_argument('-lbs', "--batch_size", type=int, default=10)
     parser.add_argument('-lr', "--local_learning_rate", type=float, default=0.005,
                         help="Local learning rate")
@@ -349,6 +350,8 @@ if __name__ == "__main__":
     # ===== FedSAM =====
     parser.add_argument('-rho', "--rho", type=float, default=1.0,
                         help="rho hyper-parameter for sam")
+    parser.add_argument('--momentum', type=float, default=0.9,
+                        help="momentum for FedSAM base optimizer")
 
     # ===== FedLogitCal =====
     parser.add_argument('-cal_tem', "--calibration_temp", type=float, default=0.1,

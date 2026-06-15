@@ -62,8 +62,8 @@ class clientMOON(object):
         self.global_model = copy.deepcopy(args.model)
         self.model = ContrastiveModelWrapper(self.model, args.use_proj_head, args.proj_dim)
         self.global_model = ContrastiveModelWrapper(self.global_model, args.use_proj_head, args.proj_dim)
-        self.model.cuda()
-        self.global_model.cuda()
+        self.model.to(self.device)
+        self.global_model.to(self.device)
         self.old_model = copy.deepcopy(self.model)
         for param in self.old_model.parameters():
             param.requires_grad = False
@@ -106,7 +106,7 @@ class clientMOON(object):
                 neg_similarity = self.cos_sim(features, features_prev_local).view(-1, 1)
                 repres_sim = torch.cat([pos_similarity, neg_similarity], dim=-1)
                 repres_sim /= self.tem
-                contrast_label = torch.zeros(repres_sim.size(0)).long().cuda()
+                contrast_label = torch.zeros(repres_sim.size(0), dtype=torch.long, device=self.device)
                 loss_con = self.loss(repres_sim, contrast_label)
                 
                 loss = loss_cls + self.mu*loss_con

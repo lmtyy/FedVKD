@@ -22,7 +22,7 @@ class FedSAM(object):
         self.num_clients = args.num_clients
         self.join_ratio = args.join_ratio
         self.random_join_ratio = args.random_join_ratio
-        self.num_join_clients = int(self.num_clients * self.join_ratio)
+        self.num_join_clients = min(self.num_clients, max(1, int(self.num_clients * self.join_ratio)))
         self.current_num_join_clients = self.num_join_clients
         self.algorithm = args.algorithm
         self.goal = args.goal
@@ -87,8 +87,14 @@ class FedSAM(object):
 
         print("\nBest accuracy.")
         print(max(self.rs_test_acc))
-        print("\nAverage time cost per round.")
-        print(sum(self.Budget[1:])/len(self.Budget[1:]))
+        print()
+        print("Average time cost per round.")
+        if len(self.Budget) > 1:
+            print(sum(self.Budget[1:]) / len(self.Budget[1:]))
+        elif self.Budget:
+            print(self.Budget[0])
+        else:
+            print(0.0)
 
     def compute_accuracy(self, model, dataloader):
         was_training = False

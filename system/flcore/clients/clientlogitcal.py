@@ -45,7 +45,7 @@ class clientLogitCal(object):
         uniq_val, uniq_count = np.unique(all_labels, return_counts=True)
         for j, c in enumerate(uniq_val.tolist()):
             class2data[c] = uniq_count[j]
-        class2data = class2data.unsqueeze(dim=0).cuda()    
+        class2data = class2data.unsqueeze(dim=0).to(self.device)    
                        
         max_local_epochs = self.local_epochs
 

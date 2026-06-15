@@ -32,7 +32,7 @@ class FedAvg(object):
         self.num_clients = args.num_clients
         self.join_ratio = args.join_ratio
         self.random_join_ratio = args.random_join_ratio
-        self.num_join_clients = int(self.num_clients * self.join_ratio)
+        self.num_join_clients = min(self.num_clients, max(1, int(self.num_clients * self.join_ratio)))
         self.current_num_join_clients = self.num_join_clients
         self.algorithm = args.algorithm
         self.goal = args.goal
@@ -103,7 +103,8 @@ class FedAvg(object):
             print("\nBest accuracy: %.4f" % max(self.rs_test_acc))
         else:
             print("\nNo accuracy recorded.")
-        print("\nAverage time cost per round.")
+        print()
+        print("Average time cost per round.")
         if len(self.Budget) > 1:
             print(sum(self.Budget[1:]) / len(self.Budget[1:]))
         elif self.Budget:

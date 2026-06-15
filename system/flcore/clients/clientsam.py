@@ -54,10 +54,10 @@ class clientSAM(object):
                 for label in labels:
                     label = label.item()  
                     self.num_per_class[label] += 1         
-            self.num_per_class = torch.Tensor(self.num_per_class).float().cuda()
+            self.num_per_class = torch.tensor(self.num_per_class, dtype=torch.float32, device=self.device)
             self.prior = self.num_per_class / self.num_per_class.sum()
             self.no_exist_label = torch.where(self.prior == 0)[0]
-            self.no_exist_label = torch.Tensor(self.no_exist_label).int().cuda()
+            self.no_exist_label = self.no_exist_label.to(dtype=torch.int64, device=self.device)
             
         self.model.train()
         
@@ -186,8 +186,8 @@ class ESAM(torch.optim.Optimizer):
         return norm
     
     def new_LADEloss(self, y_pred, target, num_per_class, prior, remine_lambda=0.1,):
-        cls_weight = (num_per_class.float() / torch.sum(num_per_class.float())).cuda()
-        balanced_prior = torch.tensor(1. / self.num_classes).float().cuda()
+        cls_weight = (num_per_class.float() / torch.sum(num_per_class.float())).to(y_pred.device)
+        balanced_prior = torch.tensor(1. / self.num_classes, dtype=torch.float32, device=y_pred.device)
         
         pred_spread = (y_pred - torch.log(prior + 1e-9) + torch.log(balanced_prior + 1e-9)).T * (target != torch.arange(0, self.num_classes).view(-1, 1).type_as(target))# C x N
 

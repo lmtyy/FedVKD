@@ -46,7 +46,7 @@ class clientRS(object):
         class2data = self.rs * torch.ones(n_class)
         for c in uniq_val:
             class2data[c] = 1.0
-        class2data = class2data.unsqueeze(dim=0).cuda()   
+        class2data = class2data.unsqueeze(dim=0).to(self.device)   
                        
         max_local_epochs = self.local_epochs
 
