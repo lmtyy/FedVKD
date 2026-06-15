@@ -66,12 +66,12 @@ class clientVKD(object):
         self.model.train()
 
         max_local_epochs = self.local_epochs
-        use_distill = (
-            round_idx >= self.warmup_rounds
-            and self.distill_weights is not None
+        can_estimate_vulnerability = (
+            self.distill_weights is not None
             and self.distill_weights.sum() > 1e-8
             and self.teacher_model is not None
         )
+        use_distill = round_idx >= self.warmup_rounds and can_estimate_vulnerability
 
         all_total_losses = []
         all_ce_losses = []
@@ -84,6 +84,8 @@ class clientVKD(object):
         for epoch in range(max_local_epochs):
             alpha_e = self._schedule_alpha(round_idx, epoch, max_local_epochs) if use_distill else 0.0
             last_alpha = alpha_e
+            vulnerability_sum = torch.zeros(self.num_classes, device=self.device)
+            vulnerability_batches = 0
 
             for x, y in data_this_client:
                 if isinstance(x, list):
@@ -99,12 +101,17 @@ class clientVKD(object):
                 kd_value = 0.0
                 logit_kd_value = 0.0
                 feat_kd_value = 0.0
+                feat_global = None
+                logit_global = None
 
-                if use_distill and alpha_e > 0:
+                if can_estimate_vulnerability:
                     with torch.no_grad():
                         feat_global, logit_global = self._forward_with_feature(self.teacher_model, x)
-                        self._update_vulnerability(logit_local, logit_global)
+                        delta_batch = F.softmax(logit_global.detach(), dim=1) - F.softmax(logit_local.detach(), dim=1)
+                        vulnerability_sum += torch.clamp(delta_batch, min=0.0).mean(dim=0)
+                        vulnerability_batches += 1
 
+                if use_distill and alpha_e > 0:
                     effective_weights = self._effective_distill_weights()
                     last_effective_weights = effective_weights
                     loss_logit = self._logit_kd_loss(logit_local, logit_global, effective_weights)
@@ -126,6 +133,8 @@ class clientVKD(object):
                 all_kd_losses.append(kd_value)
                 all_logit_kd_losses.append(logit_kd_value)
                 all_feat_kd_losses.append(feat_kd_value)
+
+            self._update_vulnerability(vulnerability_sum, vulnerability_batches)
 
         dw = self.distill_weights
         if use_distill and last_effective_weights is not None:
@@ -153,10 +162,10 @@ class clientVKD(object):
         self.train_time_cost['num_rounds'] += 1
         self.train_time_cost['total_cost'] += time.time() - start_time
 
-    def _update_vulnerability(self, logit_local, logit_global):
-        prob_teacher = F.softmax(logit_global.detach(), dim=1)
-        prob_student = F.softmax(logit_local.detach(), dim=1)
-        vulnerability_batch = torch.clamp(prob_teacher - prob_student, min=0.0).mean(dim=0)
+    def _update_vulnerability(self, vulnerability_sum, vulnerability_batches):
+        if vulnerability_batches <= 0:
+            return
+        vulnerability_batch = vulnerability_sum / max(vulnerability_batches, 1)
         self.class_vulnerability_ema = (
             self.ema_mu * self.class_vulnerability_ema
             + (1.0 - self.ema_mu) * vulnerability_batch
@@ -195,10 +204,9 @@ class clientVKD(object):
             return torch.tensor(0.0, device=logit_local.device)
 
         weight_norm = effective_weights / weight_sum
-        p_teacher = F.softmax(logit_global / T, dim=1)
         log_p_student = F.log_softmax(logit_local / T, dim=1)
-        log_p_teacher = torch.log(p_teacher + 1e-8)
-        kl_per_class = p_teacher * (log_p_teacher - log_p_student)
+        p_teacher = F.softmax(logit_global / T, dim=1)
+        kl_per_class = F.kl_div(log_p_student, p_teacher, reduction="none")
         weighted_kl = (kl_per_class * weight_norm.unsqueeze(0)).sum(dim=1).mean()
         return weighted_kl * (T ** 2)
 
@@ -211,8 +219,8 @@ class clientVKD(object):
         sample_weight = (prob_global * weight_norm.unsqueeze(0)).sum(dim=1)
         feat_local_norm = F.normalize(feat_local, dim=1)
         feat_global_norm = F.normalize(feat_global.detach(), dim=1)
-        mse_per_sample = ((feat_local_norm - feat_global_norm) ** 2).sum(dim=1)
-        return (sample_weight * mse_per_sample).sum() / (sample_weight.sum() + 1e-8)
+        normalized_feature_distance = ((feat_local_norm - feat_global_norm) ** 2).sum(dim=1)
+        return (sample_weight * normalized_feature_distance).sum() / (sample_weight.sum() + 1e-8)
 
     def _schedule_alpha(self, round_idx, epoch, total_epochs):
         if round_idx < self.warmup_rounds:
@@ -227,6 +235,8 @@ class clientVKD(object):
 
     def _forward_with_feature(self, model, x):
         feature = model.base(x)
+        if feature.dim() > 2:
+            feature = F.adaptive_avg_pool2d(feature, 1).flatten(1)
         logit = model.head(feature)
         return feature, logit
 

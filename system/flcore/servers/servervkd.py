@@ -519,22 +519,25 @@ class FedVKD(object):
             self.uploaded_ids.append(client.id)
             self.uploaded_weights.append(client.train_samples)
             self.uploaded_models.append(client.model)
+        if tot_samples <= 0:
+            raise ValueError("Total uploaded client samples must be positive.")
         for i, weight in enumerate(self.uploaded_weights):
             self.uploaded_weights[i] = weight / tot_samples
 
     def aggregate_parameters(self):
         assert len(self.uploaded_models) > 0
+        first_client_state = self.uploaded_models[0].state_dict()
         global_model_w = self.global_model.state_dict()
-        first = True
-        for weight, client_model in zip(self.uploaded_weights, self.uploaded_models):
-            client_model_w = client_model.state_dict()
-            if first:
-                for key in client_model_w:
-                    global_model_w[key] = client_model_w[key] * weight
-                first = False
-            else:
-                for key in client_model_w:
-                    global_model_w[key] += client_model_w[key] * weight
+        for key in global_model_w:
+            first_tensor = first_client_state[key]
+            if not first_tensor.is_floating_point():
+                global_model_w[key] = first_tensor.clone()
+                continue
+
+            aggregated = torch.zeros_like(first_tensor)
+            for weight, client_model in zip(self.uploaded_weights, self.uploaded_models):
+                aggregated += client_model.state_dict()[key] * weight
+            global_model_w[key] = aggregated
         self.global_model.load_state_dict(global_model_w)
 
     def check_done(self, acc_lss, top_cnt=100):
