@@ -66,7 +66,7 @@ class FedVKD(object):
         self.set_clients(clientVKD, party2loaders)
         self._init_distill_weights(party2loaders)
         if self.use_gdc:
-            self._build_prototype_bank(self.global_model, self.global_train_dl)
+            self._build_prototype_bank(self.global_model, self.party2loaders_train.values())
 
         print(f"\nJoin ratio / total clients: {self.join_ratio} / {self.num_clients}")
         print(f"HeadCal enabled: {self.use_headcal}")
@@ -105,37 +105,45 @@ class FedVKD(object):
         )
 
     @torch.no_grad()
-    def _build_prototype_bank(self, model, dataloader):
+    def _build_prototype_bank(self, model, dataloaders):
         model = model.to(self.device)
         was_training = model.training
         model.eval()
 
+        if isinstance(dataloaders, dict):
+            dataloader_iterable = dataloaders.values()
+        elif hasattr(dataloaders, "dataset"):
+            dataloader_iterable = [dataloaders]
+        else:
+            dataloader_iterable = list(dataloaders)
+
         proto_sums = None
         proto_counts = torch.zeros(self.num_classes, dtype=torch.float32, device=self.device)
 
-        for x, target in dataloader:
-            if isinstance(x, list):
-                x = x[0]
-            x = x.to(self.device)
-            target = target.to(torch.int64).to(self.device)
-            feature = model.base(x)
-            if feature.dim() > 2:
-                feature = torch.nn.functional.adaptive_avg_pool2d(feature, 1).flatten(1)
-            feature = feature.detach()
+        for dataloader in dataloader_iterable:
+            for x, target in dataloader:
+                if isinstance(x, list):
+                    x = x[0]
+                x = x.to(self.device)
+                target = target.to(torch.int64).to(self.device)
+                feature = model.base(x)
+                if feature.dim() > 2:
+                    feature = torch.nn.functional.adaptive_avg_pool2d(feature, 1).flatten(1)
+                feature = feature.detach()
 
-            if proto_sums is None:
-                proto_sums = torch.zeros(
-                    self.num_classes,
-                    feature.size(1),
-                    dtype=feature.dtype,
-                    device=self.device,
-                )
+                if proto_sums is None:
+                    proto_sums = torch.zeros(
+                        self.num_classes,
+                        feature.size(1),
+                        dtype=feature.dtype,
+                        device=self.device,
+                    )
 
-            for c in range(self.num_classes):
-                mask = (target == c)
-                if mask.any():
-                    proto_sums[c] += feature[mask].sum(dim=0)
-                    proto_counts[c] += mask.sum().float()
+                for c in range(self.num_classes):
+                    mask = (target == c)
+                    if mask.any():
+                        proto_sums[c] += feature[mask].sum(dim=0)
+                        proto_counts[c] += mask.sum().float()
 
         if proto_sums is None:
             self.prototype_bank = None
@@ -172,7 +180,8 @@ class FedVKD(object):
             self.receive_models()
             self.aggregate_parameters()
             if self.use_gdc:
-                self._build_prototype_bank(self.global_model, self.global_train_dl)
+                selected_loaders = [self.party2loaders_train[client.id] for client in self.selected_clients]
+                self._build_prototype_bank(self.global_model, selected_loaders)
 
             headcal_metrics = {}
             if self._should_run_headcal(round_idx):

@@ -321,6 +321,9 @@ class clientVKD(object):
 
     def set_parameters(self, model):
         self.model.load_state_dict(model.state_dict())
+        if self.alpha_0 <= 0:
+            self.teacher_model = None
+            return
         self.teacher_model = copy.deepcopy(model)
         self.teacher_model.eval()
         for param in self.teacher_model.parameters():
