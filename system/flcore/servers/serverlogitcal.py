@@ -67,13 +67,13 @@ class FedLogitCal(object):
             print(f"-------------{current_time}-------------")
                 
             for client in self.selected_clients:
-                client.train(self.party2loaders[client.id])
+                client.train(self.party2loaders_train[client.id])
                 
             self.receive_models()
             self.aggregate_parameters()
 
             print("\nEvaluate aggregated global model")
-            test_acc, test_loss, test_acc_per_class  = self.compute_accuracy(self.global_model, self.party2loaders_test)
+            test_acc, test_loss = self.compute_accuracy(self.global_model, self.party2loaders_test)
             print('>> Aggregated global Model Test Accuracy : %f' % test_acc)
         
             self.Budget.append(time.time() - s_t)

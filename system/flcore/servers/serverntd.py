@@ -73,7 +73,7 @@ class FedNTD(object):
             self.aggregate_parameters()
 
             print("\nEvaluate aggregated global model")
-            test_acc, test_loss, test_acc_per_class  = self.compute_accuracy(self.global_model, self.party2loaders_test)
+            test_acc, test_loss = self.compute_accuracy(self.global_model, self.party2loaders_test)
             print('>> Aggregated global Model Test Accuracy : %f' % test_acc)
            
             self.Budget.append(time.time() - s_t)

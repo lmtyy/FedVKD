@@ -68,7 +68,7 @@ class MOON(object):
             print(f"-------------{current_time}-------------")
             
             for client in self.selected_clients:
-                client.train(self.party2loaders[client.id])
+                client.train(self.party2loaders_train[client.id])
 
             self.receive_models()
             

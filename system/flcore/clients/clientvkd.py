@@ -43,6 +43,17 @@ class clientVKD(object):
         self.class_vulnerability_ema = torch.zeros(self.num_classes, device=self.device)
         self.last_round_metrics = {}
 
+        self.use_gdc = getattr(args, "use_gdc", False)
+        self.gdc_gamma = getattr(args, "gdc_gamma", 0.1)
+        self.gdc_top_m = max(1, getattr(args, "gdc_top_m", 3))
+        self.gdc_warmup_rounds = getattr(args, "gdc_warmup_rounds", -1)
+        if self.gdc_warmup_rounds < 0:
+            self.gdc_warmup_rounds = self.warmup_rounds
+        self.local_class_counts = None
+        self.missing_classes = None
+        self.prototype_bank = None
+        self.prototype_valid = None
+
     def set_distill_weights(self, local_class_counts, global_avg_per_class):
         weights = torch.zeros(self.num_classes, device=self.device)
         for c in range(self.num_classes):
@@ -54,6 +65,54 @@ class clientVKD(object):
             else:
                 weights[c] = 0.0
         self.distill_weights = weights
+        self.set_class_counts(local_class_counts)
+
+    def set_class_counts(self, local_class_counts):
+        counts = torch.as_tensor(local_class_counts, dtype=torch.float32, device=self.device)
+        self.local_class_counts = counts
+        self.missing_classes = torch.where(counts <= 0)[0]
+
+    def set_prototype_bank(self, prototype_bank, prototype_valid):
+        if prototype_bank is None or prototype_valid is None:
+            self.prototype_bank = None
+            self.prototype_valid = None
+            return
+        self.prototype_bank = prototype_bank.to(self.device)
+        self.prototype_valid = prototype_valid.to(self.device).bool()
+
+    def _gdc_lite_loss(self):
+        if not self.use_gdc:
+            return torch.tensor(0.0, device=self.device), 0, 0.0
+        if self.prototype_bank is None or self.prototype_valid is None:
+            return torch.tensor(0.0, device=self.device), 0, 0.0
+        if self.missing_classes is None or self.missing_classes.numel() == 0:
+            return torch.tensor(0.0, device=self.device), 0, 0.0
+
+        candidates = []
+        for c_tensor in self.missing_classes:
+            c = int(c_tensor.item())
+            if c < 0 or c >= self.num_classes or not bool(self.prototype_valid[c].item()):
+                continue
+            mu = self.prototype_bank[c].detach()
+            logits = self.model.head(mu.unsqueeze(0))
+            prob = F.softmax(logits.detach(), dim=1)[0, c]
+            debt = 1.0 - prob
+            candidates.append((float(debt.item()), c, mu))
+
+        if not candidates:
+            return torch.tensor(0.0, device=self.device), 0, 0.0
+
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        selected = candidates[:min(self.gdc_top_m, len(candidates))]
+        losses = []
+        debts = []
+        for debt, c, mu in selected:
+            logits = self.model.head(mu.unsqueeze(0))
+            target = torch.tensor([c], dtype=torch.long, device=self.device)
+            losses.append(F.cross_entropy(logits, target))
+            debts.append(debt)
+
+        return torch.stack(losses).mean(), len(selected), float(np.mean(debts))
 
     def train(self, data_this_client, round_idx):
         self.optimizer = torch.optim.SGD(
@@ -70,6 +129,7 @@ class clientVKD(object):
             self.distill_weights is not None
             and self.distill_weights.sum() > 1e-8
             and self.teacher_model is not None
+            and self.alpha_0 > 0
         )
         use_distill = round_idx >= self.warmup_rounds and can_estimate_vulnerability
 
@@ -78,6 +138,9 @@ class clientVKD(object):
         all_kd_losses = []
         all_logit_kd_losses = []
         all_feat_kd_losses = []
+        all_gdc_losses = []
+        all_gdc_classes = []
+        all_gdc_debts = []
         last_alpha = 0.0
         last_effective_weights = None
 
@@ -101,6 +164,9 @@ class clientVKD(object):
                 kd_value = 0.0
                 logit_kd_value = 0.0
                 feat_kd_value = 0.0
+                gdc_value = 0.0
+                gdc_classes = 0
+                gdc_debt = 0.0
                 feat_global = None
                 logit_global = None
 
@@ -124,6 +190,13 @@ class clientVKD(object):
                     logit_kd_value = loss_logit.item()
                     feat_kd_value = loss_feat.item()
 
+                use_gdc = self.use_gdc and round_idx >= self.gdc_warmup_rounds
+                if use_gdc:
+                    loss_gdc, gdc_classes, gdc_debt = self._gdc_lite_loss()
+                    if gdc_classes > 0:
+                        loss = loss + self.gdc_gamma * loss_gdc
+                        gdc_value = (self.gdc_gamma * loss_gdc).item()
+
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=10.0)
                 self.optimizer.step()
@@ -133,6 +206,9 @@ class clientVKD(object):
                 all_kd_losses.append(kd_value)
                 all_logit_kd_losses.append(logit_kd_value)
                 all_feat_kd_losses.append(feat_kd_value)
+                all_gdc_losses.append(gdc_value)
+                all_gdc_classes.append(gdc_classes)
+                all_gdc_debts.append(gdc_debt)
 
             self._update_vulnerability(vulnerability_sum, vulnerability_batches)
 
@@ -157,6 +233,9 @@ class clientVKD(object):
             "effective_weight_max": float(effective_weights.max().item()) if effective_weights is not None else 0.0,
             "vulnerability_mean": float(self.class_vulnerability_ema.mean().item()),
             "vulnerability_max": float(self.class_vulnerability_ema.max().item()),
+            "gdc_loss": float(np.mean(all_gdc_losses)) if all_gdc_losses else 0.0,
+            "gdc_classes": float(np.mean(all_gdc_classes)) if all_gdc_classes else 0.0,
+            "gdc_debt": float(np.mean(all_gdc_debts)) if all_gdc_debts else 0.0,
         }
 
         self.train_time_cost['num_rounds'] += 1

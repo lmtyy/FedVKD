@@ -58,12 +58,19 @@ class FedVKD(object):
 
         self.use_wandb = getattr(args, "use_wandb", False)
         self.use_headcal = getattr(args, "use_headcal", False)
+        self.use_gdc = getattr(args, "use_gdc", False)
+        self.prototype_bank = None
+        self.prototype_valid = None
+        self.client_class_counts = None
 
         self.set_clients(clientVKD, party2loaders)
         self._init_distill_weights(party2loaders)
+        if self.use_gdc:
+            self._build_prototype_bank(self.global_model, self.global_train_dl)
 
         print(f"\nJoin ratio / total clients: {self.join_ratio} / {self.num_clients}")
         print(f"HeadCal enabled: {self.use_headcal}")
+        print(f"FedGDC-Lite enabled: {self.use_gdc}")
         print("Finished creating FedVKD server and clients.")
 
     def _init_distill_weights(self, party2loaders):
@@ -87,6 +94,7 @@ class FedVKD(object):
                 local_class_counts=client_class_counts[cid],
                 global_avg_per_class=global_avg_per_class,
             )
+        self.client_class_counts = client_class_counts
 
         all_weights = torch.stack([c.distill_weights for c in self.clients])
         avg_num_distill = (all_weights > 0).float().sum(dim=1).mean().item()
@@ -94,6 +102,58 @@ class FedVKD(object):
         print(
             f"[Data-Aware] Avg distill classes per client: {avg_num_distill:.1f} "
             f"(full: {avg_num_full:.1f}) / {self.num_classes}"
+        )
+
+    @torch.no_grad()
+    def _build_prototype_bank(self, model, dataloader):
+        model = model.to(self.device)
+        was_training = model.training
+        model.eval()
+
+        proto_sums = None
+        proto_counts = torch.zeros(self.num_classes, dtype=torch.float32, device=self.device)
+
+        for x, target in dataloader:
+            if isinstance(x, list):
+                x = x[0]
+            x = x.to(self.device)
+            target = target.to(torch.int64).to(self.device)
+            feature = model.base(x)
+            if feature.dim() > 2:
+                feature = torch.nn.functional.adaptive_avg_pool2d(feature, 1).flatten(1)
+            feature = feature.detach()
+
+            if proto_sums is None:
+                proto_sums = torch.zeros(
+                    self.num_classes,
+                    feature.size(1),
+                    dtype=feature.dtype,
+                    device=self.device,
+                )
+
+            for c in range(self.num_classes):
+                mask = (target == c)
+                if mask.any():
+                    proto_sums[c] += feature[mask].sum(dim=0)
+                    proto_counts[c] += mask.sum().float()
+
+        if proto_sums is None:
+            self.prototype_bank = None
+            self.prototype_valid = None
+            return
+
+        proto_valid = proto_counts > 0
+        proto_bank = torch.zeros_like(proto_sums)
+        proto_bank[proto_valid] = proto_sums[proto_valid] / proto_counts[proto_valid].unsqueeze(1)
+        self.prototype_bank = proto_bank.detach().cpu()
+        self.prototype_valid = proto_valid.detach().cpu()
+
+        if was_training:
+            model.train()
+
+        print(
+            f"[FedGDC-Lite] prototype_bank valid="
+            f"{int(proto_valid.sum().item())}/{self.num_classes}"
         )
 
     def train(self):
@@ -111,6 +171,8 @@ class FedVKD(object):
 
             self.receive_models()
             self.aggregate_parameters()
+            if self.use_gdc:
+                self._build_prototype_bank(self.global_model, self.global_train_dl)
 
             headcal_metrics = {}
             if self._should_run_headcal(round_idx):
@@ -275,6 +337,14 @@ class FedVKD(object):
             "headcal_after_loss": after_loss,
         }
 
+    def _forward_model(self, model, x):
+        if hasattr(model, "base") and hasattr(model, "head"):
+            feature = model.base(x)
+            if feature.dim() > 2:
+                feature = torch.nn.functional.adaptive_avg_pool2d(feature, 1).flatten(1)
+            return model.head(feature)
+        return model(x)
+
     @torch.no_grad()
     def recalibrate_bn(self, model, loader, num_batches=50):
         model.train()
@@ -291,7 +361,7 @@ class FedVKD(object):
             x = x.to(self.device)
             if x.size(0) <= 1:
                 continue
-            model(x)
+            self._forward_model(model, x)
             seen += 1
         model.eval()
 
@@ -308,7 +378,7 @@ class FedVKD(object):
                     x = x[0]
                 x = x.to(self.device)
                 target = target.to(torch.int64).to(self.device)
-                out = model(x)
+                out = self._forward_model(model, x)
                 loss = criterion(out, target)
                 losses.append(loss.item())
                 pred = out.argmax(dim=1)
@@ -331,7 +401,7 @@ class FedVKD(object):
                 x = x[0]
             x = x.to(self.device)
             target = target.to(torch.int64).to(self.device)
-            out = model(x)
+            out = self._forward_model(model, x)
             pred = out.argmax(dim=1)
             for c in range(self.num_classes):
                 mask = (target == c)
@@ -350,6 +420,18 @@ class FedVKD(object):
         ]
         return float(np.mean(vals)) if vals else 0.0
 
+    def _missing_class_accuracy(self, per_class_acc):
+        if self.client_class_counts is None:
+            return 0.0
+
+        client_missing_acc = []
+        for cid in range(self.num_clients):
+            missing = np.where(self.client_class_counts[cid] <= 0)[0]
+            if missing.size == 0:
+                continue
+            client_missing_acc.append(float(np.mean(per_class_acc[missing])))
+        return float(np.mean(client_missing_acc)) if client_missing_acc else 0.0
+
     def _print_round_log(self, round_idx, test_acc, test_loss, per_class_acc, headcal_metrics):
         best_acc = max(self.rs_test_acc) if self.rs_test_acc else test_acc
         avg_alpha = self._metric_avg("alpha")
@@ -358,12 +440,21 @@ class FedVKD(object):
         avg_vuln_cls = self._metric_avg("num_vulnerable_classes")
         headcal_ran = headcal_metrics.get("headcal_ran", 0.0)
         headcal_delta = headcal_metrics.get("headcal_delta", 0.0)
+        macro_acc = float(np.mean(per_class_acc))
+        worst_acc = float(np.min(per_class_acc))
+        missing_acc = self._missing_class_accuracy(per_class_acc)
+        gdc_loss = self._metric_avg("gdc_loss")
+        gdc_classes = self._metric_avg("gdc_classes")
+        gdc_debt = self._metric_avg("gdc_debt")
 
         print(
             f"Round {round_idx}/{self.global_rounds} | Loss: {test_loss:.4f} | "
             f"Test Acc: {test_acc*100:.2f}% | Best: {best_acc*100:.2f}% | "
+            f"Macro: {macro_acc*100:.2f}% | Worst: {worst_acc*100:.2f}% | "
+            f"Missing: {missing_acc*100:.2f}% | "
             f"alpha={avg_alpha:.3f} distill_cls={avg_distill_cls:.1f} | "
             f"effective_cls={avg_effective_cls:.1f} vuln_cls={avg_vuln_cls:.1f} | "
+            f"GDC_loss={gdc_loss:.4f} GDC_cls={gdc_classes:.1f} debt={gdc_debt:.3f} | "
             f"HeadCal={headcal_ran:.0f} Δ={headcal_delta*100:+.2f}pt | "
             f"Time: {self.Budget[-1]:.1f}s"
         )
@@ -373,6 +464,7 @@ class FedVKD(object):
             per_class_str = " ".join([f"{acc * 100:.1f}" for acc in per_class_acc])
             print(
                 f"    [DIAG] per_class_acc=[{per_class_str}] "
+                f"macro={macro_acc*100:.2f} missing={missing_acc*100:.2f} "
                 f"std={per_class_acc.std()*100:.2f} min={per_class_acc.min()*100:.2f} "
                 f"max={per_class_acc.max()*100:.2f}"
             )
@@ -385,6 +477,11 @@ class FedVKD(object):
             print(
                 f"    [DIAG] vulnerability_mean={self._metric_avg('vulnerability_mean'):.4f} "
                 f"vulnerability_max={self._metric_avg('vulnerability_max'):.4f}"
+            )
+            print(
+                f"    [FedGDC-Lite] loss={gdc_loss:.4f} "
+                f"classes={gdc_classes:.1f} debt={gdc_debt:.3f} "
+                f"missing_acc={missing_acc*100:.2f}%"
             )
             print(
                 f"    [HeadCal] ran={headcal_metrics.get('headcal_ran', 0.0):.0f} "
@@ -407,6 +504,9 @@ class FedVKD(object):
             "server/test_acc": test_acc,
             "server/test_loss": test_loss,
             "server/best_acc": max(self.rs_test_acc) if self.rs_test_acc else test_acc,
+            "server/macro_acc": float(np.mean(per_class_acc)),
+            "server/worst_class_acc": float(np.min(per_class_acc)),
+            "server/missing_class_acc": self._missing_class_accuracy(per_class_acc),
             "server/round": round_idx,
             "headcal/ran": headcal_metrics.get("headcal_ran", 0.0),
             "headcal/loss": headcal_metrics.get("headcal_loss", 0.0),
@@ -439,6 +539,9 @@ class FedVKD(object):
             "effective_weight_max",
             "vulnerability_mean",
             "vulnerability_max",
+            "gdc_loss",
+            "gdc_classes",
+            "gdc_debt",
         ]
         for key in keys:
             log_dict[f"client/{key}_avg"] = self._metric_avg(key)
@@ -515,6 +618,8 @@ class FedVKD(object):
         for client in self.selected_clients:
             start_time = time.time()
             client.set_parameters(self.global_model)
+            if self.use_gdc:
+                client.set_prototype_bank(self.prototype_bank, self.prototype_valid)
             client.send_time_cost['num_rounds'] += 1
             client.send_time_cost['total_cost'] += 2 * (time.time() - start_time)
 

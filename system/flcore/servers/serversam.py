@@ -67,7 +67,7 @@ class FedSAM(object):
             print(f"-------------{current_time}-------------")
                 
             for client in self.selected_clients:
-                client.train(self.party2loaders[client.id])
+                client.train(self.party2loaders_train[client.id])
 
             self.receive_models()
 
@@ -75,7 +75,7 @@ class FedSAM(object):
 
 
             print("\nEvaluate global model")              
-            test_acc, test_loss = self.compute_accuracy(self.global_model, self.test_dl)
+            test_acc, test_loss = self.compute_accuracy(self.global_model, self.party2loaders_test)
             print('>> Global Model Test accuracy: %f' % test_acc)
             self.rs_test_acc.append(test_acc)
 

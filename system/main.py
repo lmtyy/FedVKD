@@ -194,10 +194,14 @@ def run(args):
             args.model, args.head = _wrap_with_base_head(args.model)
             server = FedVLS(args, run_idx, party2loaders, global_train_dl, test_dl)
 
-        elif args.algorithm in ["FedVKD", "FedVKDHeadCal"]:
+        elif args.algorithm in ["FedVKD", "FedVKDHeadCal", "FedGDCLite"]:
             args.model, args.head = _wrap_with_base_head(args.model)
             if args.algorithm == "FedVKDHeadCal":
                 args.use_headcal = True
+            if args.algorithm == "FedGDCLite":
+                args.use_gdc = True
+                args.use_headcal = False
+                args.alpha_0 = 0.0
             server = FedVKD(args, run_idx, party2loaders, global_train_dl, test_dl)
 
         elif args.algorithm == "FedMR":
@@ -381,6 +385,16 @@ if __name__ == "__main__":
     parser.add_argument('--vuln_threshold', type=float, default=0.05,
                         help='FedVKD: 脆弱度激活阈值（绝对概率差）')
 
+    # ===== FedGDC-Lite =====
+    parser.add_argument('--use_gdc', type=str2bool, default=False,
+                        help='Enable FedGDC-Lite missing-class gradient-debt compensation')
+    parser.add_argument('--gdc_gamma', type=float, default=0.1,
+                        help='FedGDC-Lite: loss weight for head-only prototype compensation')
+    parser.add_argument('--gdc_top_m', type=int, default=3,
+                        help='FedGDC-Lite: top-M missing classes selected by debt score')
+    parser.add_argument('--gdc_warmup_rounds', type=int, default=-1,
+                        help='FedGDC-Lite: warmup rounds before enabling GDC; -1 uses warmup_rounds')
+
     # ===== HeadCal =====
     parser.add_argument('--use_headcal', type=str2bool, default=False,
                         help='Enable HeadCal after FedVKD aggregation')
@@ -417,6 +431,10 @@ if __name__ == "__main__":
 
     if args.algorithm == "FedVKDHeadCal":
         args.use_headcal = True
+    if args.algorithm == "FedGDCLite":
+        args.use_gdc = True
+        args.use_headcal = False
+        args.alpha_0 = 0.0
 
     os.environ["CUDA_VISIBLE_DEVICES"] = args.device_id
 
@@ -466,7 +484,7 @@ if __name__ == "__main__":
         print("the coefficient of NTD loss : {}".format(args.beta))
     elif args.algorithm == "FedMR":
         print("the coefficient of deco loss : {}".format(args.mu))
-    elif args.algorithm in ["FedVKD", "FedVKDHeadCal"]:
+    elif args.algorithm in ["FedVKD", "FedVKDHeadCal", "FedGDCLite"]:
         print("alpha_0 : {}".format(args.alpha_0))
         print("temperature_kd : {}".format(args.temperature_kd))
         print("gamma_schedule : {}".format(args.gamma_schedule))
@@ -474,6 +492,10 @@ if __name__ == "__main__":
         print("ema_mu : {}".format(args.ema_mu))
         print("warmup_rounds : {}".format(args.warmup_rounds))
         print("vuln_threshold : {}".format(args.vuln_threshold))
+        print("use_gdc : {}".format(args.use_gdc))
+        print("gdc_gamma : {}".format(args.gdc_gamma))
+        print("gdc_top_m : {}".format(args.gdc_top_m))
+        print("gdc_warmup_rounds : {}".format(args.gdc_warmup_rounds))
         print("use_headcal : {}".format(args.use_headcal))
         print("headcal_start_round : {}".format(args.headcal_start_round))
         print("headcal_interval : {}".format(args.headcal_interval))
